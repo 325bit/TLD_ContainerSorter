@@ -3,26 +3,18 @@ using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(ContainerSorter.ContainerSorterMod), "Container Sorter", "1.0.0", "WorkBuddy")]
+[assembly: MelonInfo(typeof(ContainerSorter.ContainerSorterMod), "Container Sorter", "1.5.0", "WorkBuddy")]
 [assembly: MelonGame("Hinterland", "TheLongDark")]
 
 namespace ContainerSorter;
 
 /// <summary>
 /// 打开容器 → 按整理键（默认 R）→ 背包里与容器重复的物品按容器剩余容量塞进容器。
-/// 键位/开关在 选项 → Mod Settings → Container Sorter 里调。
+/// 键位/开关在 选项 → Mod Settings → Container Sorter 里调（按键是「点一下再按想要的键」式重绑定）。
 /// </summary>
 public class ContainerSorterMod : MelonMod
 {
 	internal static Settings? settings;
-
-	/// <summary>可绑定键，顺序必须与 <see cref="SortKey"/> 枚举一致。</summary>
-	private static readonly KeyCode[] KeyOrder =
-	{
-		KeyCode.R, KeyCode.T, KeyCode.F, KeyCode.G, KeyCode.H,
-		KeyCode.J, KeyCode.K, KeyCode.L, KeyCode.N, KeyCode.M,
-		KeyCode.B, KeyCode.V, KeyCode.C, KeyCode.X, KeyCode.Z
-	};
 
 	private const float CooldownSeconds = 0.25f;
 
@@ -36,7 +28,19 @@ public class ContainerSorterMod : MelonMod
 		{
 			settings = new Settings();
 			settings.AddToModSettings("Container Sorter");
-			LoggerInstance.Msg("Container Sorter 已加载：打开容器后按 R（可在 选项 → Mod Settings → Container Sorter 改）");
+
+			// 1.0 版的设置文件里 Key 是 0（旧枚举 R），换成 KeyCode 后会读成 None：这里纠正并落盘
+			if (settings.Key == KeyCode.None)
+			{
+				settings.Key = KeyCode.R;
+				settings.Save();
+			}
+
+			LoggerInstance.Msg($"Container Sorter 已加载：整理键 = {settings.Key}"
+				+ "（选项 → Mod Settings → Container Sorter 里可重新绑定）");
+
+			// 忽略清单：文件不存在就按模板建一个
+			IgnoreList.EnsureFile(LoggerInstance);
 		}
 		catch (Exception ex)
 		{
@@ -60,7 +64,7 @@ public class ContainerSorterMod : MelonMod
 		bool pressed;
 		try
 		{
-			pressed = Pressed(settings.Key);
+			pressed = Pressed(settings.EffectiveKey);
 		}
 		catch (Exception ex)
 		{
@@ -92,12 +96,11 @@ public class ContainerSorterMod : MelonMod
 		}
 	}
 
-	private static bool Pressed(SortKey key)
+	private static bool Pressed(KeyCode key)
 	{
-		int index = (int)key;
-		if (index < 0 || index >= KeyOrder.Length)
+		if (key == KeyCode.None)
 		{
-			index = 0; // 枚举被人为改成越界值时退回 R
+			return false;
 		}
 
 		if (settings!.RequireCtrl)
@@ -109,6 +112,6 @@ public class ContainerSorterMod : MelonMod
 			}
 		}
 
-		return Input.GetKeyDown(KeyOrder[index]);
+		return Input.GetKeyDown(key);
 	}
 }
