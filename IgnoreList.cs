@@ -15,7 +15,7 @@ internal enum IgnoreMode
 	/// <summary>全部无视：一个都不搬。</summary>
 	IgnoreAll = 1,
 
-	/// <summary>保留一个：背包留 keepCount 个，其余搬进容器。</summary>
+	/// <summary>保留（至少一个）：背包留 keepCount 个，其余搬进容器。</summary>
 	KeepOne = 2,
 }
 
@@ -37,14 +37,26 @@ internal readonly struct IgnoreRule
 /// <summary>
 /// Mods\ContainerSorterIgnore.txt 里的物品规则。
 /// 文件按行分隔，每行一个物品 ID（prefab 名）；# 或 // 开头为注释。
+/// 条目可以带份数后缀「ID*数字」：背包留 N 个，其余搬进容器（不带数字默认 1）。
+/// 分隔符用 * 而不是 #，因为 # 本身就是注释符号，两者混在一起会有歧义。
 /// 整行只写分区标记的注释会切换后面的处理方式：
-///   #全部无视/Ignore All  → 之后列出的物品永不搬进容器（文件开头默认就是这个模式）
-///   #保留一个/Keep One    → 之后列出的物品背包留 1 个，其余搬进容器
+///   #全部无视/Ignore All                → 之后列出的物品永不搬进容器（文件开头默认就是这个模式）
+///   #保留（至少一个）/Keep At Least One → 之后列出的物品背包至少留 1 个，其余搬进容器
 /// 每次整理前按文件修改时间判断是否需要重读，所以改完存盘、下次按键就生效，不用重启。
 /// </summary>
 internal static class IgnoreList
 {
 	internal const string FileName = "ContainerSorterIgnore.txt";
+
+	/// <summary>份数后缀的最大值，防止手滑写出天文数字。</summary>
+	private const int MaxKeepCount = 999;
+
+	/// <summary>
+	/// 份数分隔符。<c>GEAR_X*4</c> 表示留 4 个。
+	/// 用 <c>*</c> 而不是 <c>#</c>：<c>#</c> 本身就是注释符号，两者放一起会有歧义
+	/// （例如 <c>GEAR_X # 4 个备用</c> 到底是份数还是注释）。
+	/// </summary>
+	private const char Separator = '*';
 
 	/// <summary>首次运行写出来的模板：全部是注释，等于默认不忽略任何东西。</summary>
 	private const string Template =
@@ -56,9 +68,15 @@ internal static class IgnoreList
 		"# 以 # 或 // 开头的行是注释，行尾也能跟注释 / # or // starts a comment, trailing comments are fine\r\n" +
 		"# 改完保存就生效，不用重启游戏 / Save the file, it reloads on the next sort, no restart needed\r\n" +
 		"#\r\n" +
+		"# 保留份数（可选）/ Custom keep count (optional)\r\n" +
+		"#   物品ID*数字 → 背包留 N 个，其余搬走 / keep N in the backpack, move the rest\r\n" +
+		"#   只写物品ID  → 默认留 1 个 / without a number it defaults to 1\r\n" +
+		"#   例 / e.g.：GEAR_HeavyBandage*4 留 4 个，GEAR_OldMansBeardDressing*2 留 2 个\r\n" +
+		"#   注意 / note：分隔符是 *（星号），别用 #，因为 # 是注释符号 / use * (asterisk), # is the comment symbol\r\n" +
+		"#\r\n" +
 		"# 分区标记（整行注释里只写标记本身，不要跟说明文字）/ Section markers (marker only, no extra text)\r\n" +
 		"#   全部无视 / Ignore All ：这一段列出的物品永远不会被搬走 / items here are never moved into containers\r\n" +
-		"#   保留一个 / Keep One   ：这一段列出的物品背包留 1 个，其余搬走 / keep 1 in the backpack, move the rest\r\n" +
+		"#   保留（至少一个） / Keep At Least One ：这一段列出的物品背包至少留 1 个，其余搬走 / keep at least 1, move the rest\r\n" +
 		"# 第一个标记之前的条目按「全部无视」处理 / Entries before the first marker default to Ignore All\r\n" +
 		"# ==================================================================\r\n" +
 		"\r\n" +
@@ -66,8 +84,9 @@ internal static class IgnoreList
 		"# GEAR_Revolver\r\n" +
 		"# GEAR_Arrow\r\n" +
 		"\r\n" +
-		"#保留一个/Keep One\r\n" +
+		"#保留（至少一个）/Keep At Least One\r\n" +
 		"# GEAR_Hacksaw\r\n" +
+		"# GEAR_HeavyBandage*4\r\n" +
 		"# GEAR_SewingKit\r\n";
 
 	private static readonly Dictionary<string, IgnoreRule> rules = new(StringComparer.OrdinalIgnoreCase);
@@ -139,6 +158,7 @@ internal static class IgnoreList
 			IgnoreMode mode = IgnoreMode.IgnoreAll; // 第一个标记之前按老行为：全部无视
 			int modeKeep = 1;
 			int lineNo = 0;
+			int customCounts = 0;
 
 			foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
 			{
@@ -161,24 +181,42 @@ internal static class IgnoreList
 					{
 						mode = markerMode;
 						modeKeep = markerKeep;
-						log.Msg($"  清单分区切换 → {(mode == IgnoreMode.IgnoreAll ? "全部无视/Ignore All" : $"保留 {modeKeep} 个/Keep {modeKeep}")}");
+						log.Msg($"  清单分区切换 → {(mode == IgnoreMode.IgnoreAll ? "全部无视/Ignore All" : $"保留（至少一个）/Keep At Least One，默认 {modeKeep} 个")}");
 					}
 
 					continue;
 				}
 
-				string entry = StripComment(trimmed);
-				var rule = new IgnoreRule(mode, modeKeep);
-
-				foreach (string one in SplitEntry(entry, log, lineNo))
+				string entry = ExtractEntryText(raw, log, lineNo);
+				if (entry.Length == 0)
 				{
-					next[one] = rule;
-					primaries.Add(one);
+					continue;
+				}
+
+				foreach (EntryToken token in SplitEntry(entry, log, lineNo))
+				{
+					// 行内写了 *数字 就以它为准（显式覆盖分区默认值）
+					int keepForEntry = token.KeepCount > 0 ? Math.Min(token.KeepCount, MaxKeepCount) : modeKeep;
+					IgnoreMode modeForEntry = token.KeepCount > 0 ? IgnoreMode.KeepOne : mode;
+					var rule = new IgnoreRule(modeForEntry, keepForEntry);
+
+					if (token.KeepCount > 0 && mode == IgnoreMode.IgnoreAll)
+					{
+						log.Msg($"  第 {lineNo} 行 {token.Name} 指定保留 {keepForEntry} 个，按「保留」处理（覆盖所在分区的全部无视）");
+					}
+
+					next[token.Name] = rule;
+					primaries.Add(token.Name);
+
+					if (token.KeepCount > 0)
+					{
+						customCounts++;
+					}
 
 					// 允许省略 GEAR_ 前缀：同时塞一个去前缀的别名
-					if (one.StartsWith("GEAR_", StringComparison.OrdinalIgnoreCase) && one.Length > 5)
+					if (token.Name.StartsWith("GEAR_", StringComparison.OrdinalIgnoreCase) && token.Name.Length > 5)
 					{
-						next[one.Substring(5)] = rule;
+						next[token.Name.Substring(5)] = rule;
 					}
 				}
 			}
@@ -210,7 +248,9 @@ internal static class IgnoreList
 			loaded = true;
 			lastWriteUtc = stamp;
 
-			log.Msg($"忽略清单已载入：全部无视 {ignoreTotal} 个，保留一个 {keepTotal} 个（{path}）");
+			log.Msg($"忽略清单已载入：全部无视 {ignoreTotal} 个，保留（至少一个）{keepTotal} 个"
+				+ (customCounts > 0 ? $"，其中 {customCounts} 个自带份数（ID*数字）" : string.Empty)
+				+ $"（{path}）");
 		}
 		catch (Exception e)
 		{
@@ -299,20 +339,26 @@ internal static class IgnoreList
 		if (squashed.StartsWith("保留", StringComparison.Ordinal))
 		{
 			tail = squashed.Substring(2);
-			if (tail.EndsWith("个", StringComparison.Ordinal))
-			{
-				tail = tail.Substring(0, tail.Length - 1);
-			}
 
-			if (tail.Length == 0)
+			if (tail.Length == 0 || IsAtLeastOnePhrase(tail))
 			{
 				mode = IgnoreMode.KeepOne;
 				return true;
+			}
+
+			if (tail.EndsWith("个", StringComparison.Ordinal))
+			{
+				tail = tail.Substring(0, tail.Length - 1);
 			}
 		}
 		else if (squashed.StartsWith("keep", StringComparison.Ordinal))
 		{
 			tail = squashed.Substring(4);
+			if (IsAtLeastOnePhrase(tail))
+			{
+				mode = IgnoreMode.KeepOne;
+				return true;
+			}
 		}
 		else
 		{
@@ -326,8 +372,30 @@ internal static class IgnoreList
 		}
 
 		mode = IgnoreMode.KeepOne;
-		keepCount = Math.Min(n, 99);
+		keepCount = Math.Min(n, MaxKeepCount);
 		return true;
+	}
+
+	/// <summary>
+	/// 「保留（至少一个）」这类带括号、不带具体数字的写法 —— 表示「默认留 1 个」。
+	/// 全角/半角括号、中英写法都认；判定前先去掉括号。
+	/// </summary>
+	private static bool IsAtLeastOnePhrase(string tail)
+	{
+		string bare = tail.Trim('（', '）', '(', ')');
+
+		switch (bare)
+		{
+			case "至少一个":
+			case "至少1个":
+			case "至少一":
+			case "至少1":
+			case "atleastone":
+			case "atleast1":
+				return true;
+		}
+
+		return false;
 	}
 
 	private static int ParseNumber(string text)
@@ -389,7 +457,26 @@ internal static class IgnoreList
 		return sb.ToString();
 	}
 
-	private static IEnumerable<string> SplitEntry(string line, MelonLogger.Instance log, int lineNo)
+	/// <summary>一行拆出来的单个条目：物品名 + 行内指定的保留份数（0 = 没写，按分区默认）。</summary>
+	private readonly struct EntryToken
+	{
+		internal EntryToken(string name, int keepCount)
+		{
+			Name = name;
+			KeepCount = keepCount;
+		}
+
+		internal string Name { get; }
+
+		internal int KeepCount { get; }
+	}
+
+	/// <summary>
+	/// 拆一行里的多个条目（逗号/分号/制表符）。每个条目允许带「*数字」后缀表示保留份数：
+	/// <c>GEAR_HeavyBandage*4</c> → 名字 GEAR_HeavyBandage、留 4 个。
+	/// 分隔符用 * 不用 #：# 是注释符号，放一起会有歧义。
+	/// </summary>
+	private static List<EntryToken> SplitEntry(string line, MelonLogger.Instance log, int lineNo)
 	{
 		// 容忍从别处粘贴过来的引号
 		if (line.Length >= 2 && ((line[0] == '"' && line[^1] == '"') || (line[0] == '\'' && line[^1] == '\'')))
@@ -397,17 +484,45 @@ internal static class IgnoreList
 			line = line.Substring(1, line.Length - 2).Trim();
 		}
 
+		var result = new List<EntryToken>();
 		if (line.Length == 0)
 		{
-			return Array.Empty<string>();
+			return result;
 		}
 
-		var result = new List<string>();
-
-		// 一行里用逗号/分号/制表符分隔多个也算合法
 		foreach (string part in line.Split(new[] { ',', '，', ';', '；', '\t' }, StringSplitOptions.RemoveEmptyEntries))
 		{
-			string one = NormalizeName(part);
+			string text = part.Trim();
+			if (text.Length == 0)
+			{
+				continue;
+			}
+
+			int keepCount = 0;
+			int star = IndexOfSeparator(text);
+			if (star >= 0)
+			{
+				string head = text.Substring(0, star).Trim();
+				keepCount = ParseCountSuffix(text, star, out int digitsEnd);
+
+				if (keepCount > 0)
+				{
+					if (digitsEnd < text.Length)
+					{
+						// *数字 后面还有字（比如 "GEAR_X*4 备用"），多余的当备注忽略
+						log.Msg($"  忽略清单第 {lineNo} 行 {head} 后面还有内容，已忽略：{text.Substring(digitsEnd).Trim()}");
+					}
+				}
+				else
+				{
+					// * 后面不是数字 —— 整段当备注丢掉，避免把 "GEAR_X* 备注" 当成物品名
+					log.Warning($"忽略清单第 {lineNo} 行 {head} 的 {Separator} 后面不是数字，已忽略：{text.Substring(star + 1).Trim()}");
+				}
+
+				text = head;
+			}
+
+			string one = NormalizeName(text);
 			if (one.Length == 0)
 			{
 				continue;
@@ -418,7 +533,13 @@ internal static class IgnoreList
 				log.Warning($"忽略清单第 {lineNo} 行有无法识别的空格，已按原样处理：{one}");
 			}
 
-			result.Add(one);
+			if (keepCount > MaxKeepCount)
+			{
+				log.Warning($"忽略清单第 {lineNo} 行的保留份数 {keepCount} 太大，已按 {MaxKeepCount} 处理：{one}");
+				keepCount = MaxKeepCount;
+			}
+
+			result.Add(new EntryToken(one, keepCount));
 		}
 
 		return result;
@@ -429,7 +550,11 @@ internal static class IgnoreList
 		return line.StartsWith("#", StringComparison.Ordinal) || line.StartsWith("//", StringComparison.Ordinal);
 	}
 
-	private static string StripComment(string raw)
+	/// <summary>
+	/// 去掉行尾注释（<c>//</c> 或 <c>#</c>）。份数后缀用的是 <c>*</c>，不受影响，
+	/// 所以 <c>GEAR_X*4</c> 不会被当成注释。若见到 <c>#数字</c> 这种旧写法，提示改用 <c>*</c>。
+	/// </summary>
+	private static string ExtractEntryText(string raw, MelonLogger.Instance log, int lineNo)
 	{
 		string line = raw.Trim();
 		if (line.Length == 0 || IsComment(line))
@@ -437,19 +562,81 @@ internal static class IgnoreList
 			return string.Empty;
 		}
 
-		int hash = line.IndexOf('#');
-		if (hash >= 0)
-		{
-			line = line.Substring(0, hash).Trim();
-		}
-
 		int slash = line.IndexOf("//", StringComparison.Ordinal);
+		int hash = line.IndexOf('#');
+		int cut = -1;
+
 		if (slash >= 0)
 		{
-			line = line.Substring(0, slash).Trim();
+			cut = slash;
 		}
 
-		return line;
+		if (hash >= 0 && (cut < 0 || hash < cut))
+		{
+			cut = hash;
+
+			// 旧写法 ID#4 里的 # 现在会被当成注释，这里给一句提示，免得悄悄变成「留 1 个」。
+			// 只在 # 紧跟数字（老写法）时提示，`GEAR_X # 4 个备用` 这种正常注释不吵。
+			int k = hash + 1;
+			if (k < line.Length && char.IsDigit(line[k]))
+			{
+				log.Warning($"忽略清单第 {lineNo} 行的 {Separator} 才是份数分隔符，# 是注释符号：{line.Substring(0, hash).Trim()}{Separator}{line.Substring(k)} 会被当成注释，"
+					+ $"该项按默认份数处理");
+			}
+		}
+
+		return cut < 0 ? line.Trim() : line.Substring(0, cut).Trim();
+	}
+
+	/// <summary>份数分隔符的位置；全角 ＊（中文输入法下容易打出来）一并当分隔符。</summary>
+	private static int IndexOfSeparator(string text)
+	{
+		for (int i = 0; i < text.Length; i++)
+		{
+			if (text[i] == Separator || text[i] == '＊')
+			{
+				return i;
+			}
+		}
+
+		return -1;
+	}
+
+	/// <summary>
+	/// 从 <paramref name="starIndex"/> 处的 <c>*</c> 读份数。合法时返回份数并给出数字后的下标，否则返回 0。
+	/// </summary>
+	private static int ParseCountSuffix(string text, int starIndex, out int digitsEnd)
+	{
+		digitsEnd = starIndex;
+
+		int i = starIndex + 1;
+		while (i < text.Length && (text[i] == ' ' || text[i] == '\u3000'))
+		{
+			i++;
+		}
+
+		int start = i;
+		while (i < text.Length && char.IsDigit(text[i]))
+		{
+			i++;
+		}
+
+		if (i == start)
+		{
+			return 0;
+		}
+
+		if (i < text.Length)
+		{
+			char next = text[i];
+			if (!(char.IsWhiteSpace(next) || next == ',' || next == '，' || next == ';' || next == '；' || next == '\t'))
+			{
+				return 0; // 例如 "*4张" 这种明显不是份数
+			}
+		}
+
+		digitsEnd = i;
+		return int.TryParse(text.Substring(start, i - start), out int value) ? value : 0;
 	}
 
 	/// <summary>Unity 实例名会带 (Clone) 后缀，统一去掉再比较。</summary>

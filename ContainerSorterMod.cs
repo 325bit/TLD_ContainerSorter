@@ -3,7 +3,7 @@ using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(ContainerSorter.ContainerSorterMod), "Container Sorter", "1.5.0", "WorkBuddy")]
+[assembly: MelonInfo(typeof(ContainerSorter.ContainerSorterMod), "Container Sorter", "1.9.0", "Hemalurgic")]
 [assembly: MelonGame("Hinterland", "TheLongDark")]
 
 namespace ContainerSorter;

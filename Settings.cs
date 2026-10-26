@@ -30,12 +30,16 @@ internal class Settings : JsonModSettings
 	public bool SkipSatchel = true;
 
 	[Name("启用忽略清单")]
-	[Description("开启后读取 Mods\\ContainerSorterIgnore.txt：「#全部无视」段里的物品不搬，「#保留一个」段里的物品背包留 1 个、其余搬进容器。改完文件存盘即生效，无需重启。")]
+	[Description("开启后读取 Mods\\ContainerSorterIgnore.txt：「#全部无视」段里的物品不搬，「#保留（至少一个）」段里的物品背包留 N 个（默认 1，写 ID*数字 可指定）、其余搬进容器。改完文件存盘即生效，无需重启。")]
 	public bool UseIgnoreList = true;
 
 	[Name("保留时优先把高耐久放进容器")]
-	[Description("「保留一个」遇到同种物品耐久不同时，背包留耐久最低的那件，状态好的收进容器。关掉则反过来：背包留最好的。")]
+	[Description("「保留（至少一个）」遇到同种物品耐久不同时，背包留耐久最低的那件，状态好的收进容器。关掉则反过来：背包留最好的。")]
 	public bool KeepBestInContainer = true;
+
+	[Name("耐久相同时优先搬更重的")]
+	[Description("「保留（至少一个）」遇到同种物品耐久一样、重量不同时，背包留单份更轻的那个，重的搬进容器（主要针对肉类：同样新鲜度下先搬 1kg 的肉块，半公斤的留在背包）。容器快满时也按这个顺序先塞重的。")]
+	public bool HeavierFirstWhenEqualCondition = true;
 
 	[Name("输出详细日志")]
 	[Description("每次触发都把逐件迁移明细写进 MelonLoader 日志，排查问题时打开。")]

@@ -81,11 +81,18 @@ internal static class ContainerTransfer
 			IgnoreList.Reload(log);
 		}
 
-		// 「保留一个」的物品如果背包里有好几件/好几堆，先挑出要留下的那一个
-		// （默认留耐久最差的，好状态优先送进容器）
-		Dictionary<string, GearItem> keepers = cfg.UseIgnoreList
+		// 「保留（至少一个）」的物品先挑出要留在背包的那几个实例（默认 1 个，ID*数字 可指定 N 个）
+		Dictionary<string, List<KeeperPick>> keepers = cfg.UseIgnoreList
 			? PickKeepers(stock, containerKinds, cfg)
-			: new Dictionary<string, GearItem>(StringComparer.OrdinalIgnoreCase);
+			: new Dictionary<string, List<KeeperPick>>(StringComparer.OrdinalIgnoreCase);
+
+		// 迁移顺序：同一类物品里「整件要搬走的」排在「留在背包的」前面，
+		// 同类内每份更重的先搬 —— 容器剩余空间只够一部分时，先塞进去的是重的那几块肉。
+		// 不同种类之间的先后保持背包原序。
+		if (cfg.HeavierFirstWhenEqualCondition)
+		{
+			stock = OrderForTransfer(stock, keepers);
+		}
 
 		int moved = 0;
 		int merged = 0;
@@ -93,6 +100,7 @@ internal static class ContainerTransfer
 		int failed = 0;
 		int ignored = 0;
 		int kept = 0;
+		int partialMoves = 0;
 		float movedKg = 0f;
 
 		foreach (GearItem gi in stock)
@@ -147,11 +155,11 @@ internal static class ContainerTransfer
 			int keep = 0;
 			if (rule.Mode == IgnoreMode.KeepOne)
 			{
-				bool isKeeper = keepers.TryGetValue(kind, out GearItem? keeper) && IsSameInstance(gi, keeper);
+				bool isKeeper = TryGetKeeper(keepers, kind, gi, out int keeperUnits);
 
 				if (!isKeeper)
 				{
-					keep = 0; // 同类多出来的那几件整件搬走
+					keep = 0; // 同类里不需要留的那些整件搬走
 				}
 				else if (!stackable)
 				{
@@ -159,7 +167,7 @@ internal static class ContainerTransfer
 				}
 				else
 				{
-					keep = Math.Min(rule.KeepCount, units);
+					keep = Math.Min(keeperUnits, units);
 				}
 
 				if (keep >= units)
@@ -168,8 +176,10 @@ internal static class ContainerTransfer
 					if (cfg.Verbose)
 					{
 						float cond = Condition(gi);
-						log.Msg($"  = {name} 按「保留一个」留在背包（{units} 个"
-							+ (cond >= 0f ? $"，耐久 {cond * 100f:0}%" : string.Empty) + "）");
+						float unit = UnitKilograms(gi);
+						log.Msg($"  = {name} 按「保留」留在背包（{units} 个"
+							+ (cond >= 0f ? $"，耐久 {cond * 100f:0}%" : string.Empty)
+							+ (unit > 0f ? $"，单份 {unit:0.##}kg" : string.Empty) + "）");
 					}
 
 					continue; // 没得搬
@@ -185,13 +195,31 @@ internal static class ContainerTransfer
 
 			if (moveKg > left + Epsilon)
 			{
-				tooHeavy++;
-				if (cfg.Verbose)
+				// 整组塞不下：能拆堆的就按剩余容量拆出一部分先搬，剩下的留在背包。
+				// 只有「连一份都放不下」才真跳过 —— 100 张狼皮在 40kg 余量里能塞几十张，
+				// 不能因为整组 50kg 就直接一张都不搬。
+				int fitUnits = stackable ? FitUnits(left, unitKg, moveUnits) : 0;
+
+				if (fitUnits <= 0)
 				{
-					log.Msg($"  跳过 {name}（{moveKg:0.###}kg > 剩余 {left:0.###}kg）");
+					tooHeavy++;
+					if (cfg.Verbose)
+					{
+						log.Msg($"  跳过 {name}（{moveKg:0.###}kg > 剩余 {left:0.###}kg，连一份都放不下）");
+					}
+
+					continue;
 				}
 
-				continue;
+				if (cfg.Verbose)
+				{
+					log.Msg($"  剩余 {left:0.###}kg 只够 {fitUnits}/{units} 份（共 {moveKg:0.###}kg），先搬这些");
+				}
+
+				keep = units - fitUnits;   // 装不下的部分继续留在背包
+				moveUnits = fitUnits;
+				moveKg = unitKg * moveUnits;
+				partialMoves++;
 			}
 
 			bool ok;
@@ -248,7 +276,8 @@ internal static class ContainerTransfer
 		log.Msg($"整理完成：放入 {moved} 件（{movedKg:0.##}kg）"
 			+ (merged > 0 ? $"，其中 {merged} 件并进已有堆叠" : string.Empty)
 			+ (ignored > 0 ? $"，{ignored} 件按忽略清单跳过" : string.Empty)
-			+ (kept > 0 ? $"，{kept} 件按「保留一个」留在背包" : string.Empty)
+			+ (kept > 0 ? $"，{kept} 件按「保留」留在背包" : string.Empty)
+			+ (partialMoves > 0 ? $"，{partialMoves} 堆因剩余容量只搬了一部分" : string.Empty)
 			+ (tooHeavy > 0 ? $"，{tooHeavy} 件放不下" : string.Empty)
 			+ (failed > 0 ? $"，{failed} 件失败" : string.Empty)
 			+ $"，容器剩余 {nowLeft:0.##}kg");
@@ -298,14 +327,16 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 「保留一个」的每种物品挑一个实例留在背包。只有容器里也有的种类才参与，其它种类本来就不会被搬。
-	/// 默认留**耐久最低**的那一个：好状态的东西优先收进容器，背包里留着自己在用的那件（容易被消耗/用坏）。
+	/// 「保留（至少一个）」的每种物品挑出要留在背包的实例。只有容器里也有的种类才参与，其它种类本来就不会被搬。
+	/// 留几个：清单里写 <c>ID*数字</c> 就是 N 个，不写默认 1 个；堆叠物品按份数累计，够数就停。
+	/// 挑谁留：耐久低的先留（好状态收进容器）；耐久打平 → 单份更轻的先留（重的进容器，主要是肉类）。
 	/// 关掉设置里的「保留时优先把高耐久放进容器」就退回老行为：留状态最好的。
 	/// </summary>
-	private static Dictionary<string, GearItem> PickKeepers(List<GearItem> stock, HashSet<string> containerKinds, Settings cfg)
+	private static Dictionary<string, List<KeeperPick>> PickKeepers(List<GearItem> stock, HashSet<string> containerKinds, Settings cfg)
 	{
-		var keepers = new Dictionary<string, GearItem>(StringComparer.OrdinalIgnoreCase);
-		bool keepWorst = cfg.KeepBestInContainer;
+		var result = new Dictionary<string, List<KeeperPick>>(StringComparer.OrdinalIgnoreCase);
+		var candidates = new Dictionary<string, List<GearItem>>(StringComparer.OrdinalIgnoreCase);
+		var order = new List<string>();
 
 		foreach (GearItem gi in stock)
 		{
@@ -321,32 +352,137 @@ internal static class ContainerTransfer
 				continue;
 			}
 
-			if (!keepers.TryGetValue(kind, out GearItem? current))
+			if (!candidates.TryGetValue(kind, out List<GearItem>? list))
 			{
-				keepers[kind] = gi;
-				continue;
+				list = new List<GearItem>();
+				candidates[kind] = list;
+				order.Add(kind);
 			}
 
-			float candidate = Condition(gi);
-			float currentValue = Condition(current);
+			list.Add(gi);
+		}
 
-			// 读不到耐久（没有 condition 的物品）就不换，保留先扫描到的那件
-			if (candidate < 0f || currentValue < 0f)
+		foreach (string kind in order)
+		{
+			List<GearItem> list = candidates[kind];
+			int need = Math.Max(1, IgnoreList.Lookup(kind).KeepCount);
+
+			// 越靠前越该留在背包：耐久低 → 单份轻 → 实例 ID（保证每次结果一致）
+			list.Sort((a, b) => CompareKeepPriority(a, b, cfg));
+
+			var picks = new List<KeeperPick>();
+			int remaining = need;
+
+			foreach (GearItem gi in list)
 			{
-				continue;
+				if (remaining <= 0)
+				{
+					break;
+				}
+
+				int units = UnitsOf(gi);
+				int take = Math.Min(units, remaining);
+				picks.Add(new KeeperPick(gi, take));
+				remaining -= take;
 			}
 
-			bool replace = keepWorst
-				? candidate < currentValue - 0.0001f   // 留最差的
-				: candidate > currentValue + 0.0001f;  // 留最好的
-
-			if (replace)
+			if (picks.Count > 0)
 			{
-				keepers[kind] = gi;
+				result[kind] = picks;
 			}
 		}
 
-		return keepers;
+		return result;
+	}
+
+	/// <summary>留在背包的一件/一堆，以及从它身上留几份。</summary>
+	private readonly struct KeeperPick
+	{
+		internal KeeperPick(GearItem item, int keepUnits)
+		{
+			Item = item;
+			KeepUnits = keepUnits;
+		}
+
+		internal GearItem Item { get; }
+
+		internal int KeepUnits { get; }
+	}
+
+	private static bool TryGetKeeper(Dictionary<string, List<KeeperPick>> keepers, string kind, GearItem gi, out int keepUnits)
+	{
+		keepUnits = 0;
+
+		if (!keepers.TryGetValue(kind, out List<KeeperPick>? picks) || picks == null)
+		{
+			return false;
+		}
+
+		for (int i = 0; i < picks.Count; i++)
+		{
+			if (IsSameInstance(gi, picks[i].Item))
+			{
+				keepUnits = picks[i].KeepUnits;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/// <summary>排序用：结果为负表示 a 更该留在背包。</summary>
+	private static int CompareKeepPriority(GearItem a, GearItem b, Settings cfg)
+	{
+		float condA = Condition(a);
+		float condB = Condition(b);
+
+		// 读不到耐久（没有 condition 的物品）就跳过耐久比较，直接比重量
+		if (condA >= 0f && condB >= 0f && Math.Abs(condA - condB) > 0.001f)
+		{
+			return cfg.KeepBestInContainer
+				? condA.CompareTo(condB)   // 留耐久低的
+				: condB.CompareTo(condA);  // 留耐久高的
+		}
+
+		float kgA = UnitKilograms(a);
+		float kgB = UnitKilograms(b);
+		if (cfg.HeavierFirstWhenEqualCondition && kgA > 0f && kgB > 0f && Math.Abs(kgA - kgB) > 0.0001f)
+		{
+			return kgA.CompareTo(kgB); // 留单份更轻的
+		}
+
+		return InstanceId(a).CompareTo(InstanceId(b));
+	}
+
+	private static int InstanceId(GearItem gi)
+	{
+		try
+		{
+			return gi.m_InstanceID;
+		}
+		catch
+		{
+			return 0;
+		}
+	}
+
+	/// <summary>这一件算几份：堆叠就是 m_Units，非堆叠算 1。</summary>
+	private static int UnitsOf(GearItem gi)
+	{
+		try
+		{
+			StackableItem? st = gi.m_StackableItem;
+			if (st != null && st.m_Units > 0)
+			{
+				return st.m_Units;
+			}
+		}
+		catch
+		{
+			// 读不到就当单件
+		}
+
+		return 1;
 	}
 
 	private static bool IsSameInstance(GearItem a, GearItem b)
@@ -359,6 +495,78 @@ internal static class ContainerTransfer
 		{
 			return false;
 		}
+	}
+
+	/// <summary>
+	/// 重排迁移顺序（同类分组的稳定排序）：
+	///   1. 整件要搬走的排在「按保留留在背包」的前面，免得先占空间的是不搬的那件；
+	///   2. 同类内按**单份重量**从重到轻，容器剩余空间不够时先塞进去的是重的那几块肉；
+	///   3. 不同种类之间保持背包原序。
+	/// </summary>
+	private static List<GearItem> OrderForTransfer(List<GearItem> stock, Dictionary<string, List<KeeperPick>> keepers)
+	{
+		var groupRank = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+		var keyed = new List<SortEntry>(stock.Count);
+
+		foreach (GearItem gi in stock)
+		{
+			string? name = SafeName(gi);
+			string kind = name == null ? "\u0000invalid" : NormalizeName(name);
+			if (!groupRank.TryGetValue(kind, out int group))
+			{
+				group = groupRank.Count;
+				groupRank[kind] = group;
+			}
+
+			keyed.Add(new SortEntry(gi, group, IsFullyKept(gi, kind, keepers) ? 1 : 0, UnitKilograms(gi)));
+		}
+
+		keyed.Sort((a, b) =>
+		{
+			int c = a.Group.CompareTo(b.Group);
+			if (c != 0)
+			{
+				return c;
+			}
+
+			c = a.Kept.CompareTo(b.Kept);
+			if (c != 0)
+			{
+				return c;
+			}
+
+			return b.UnitKg.CompareTo(a.UnitKg); // 重的在前
+		});
+
+		var ordered = new List<GearItem>(keyed.Count);
+		foreach (SortEntry e in keyed)
+		{
+			ordered.Add(e.Item);
+		}
+
+		return ordered;
+	}
+
+	private readonly struct SortEntry
+	{
+		internal SortEntry(GearItem item, int group, int kept, float unitKg)
+		{
+			Item = item;
+			Group = group;
+			Kept = kept;
+			UnitKg = unitKg;
+		}
+
+		internal GearItem Item { get; }
+		internal int Group { get; }
+		internal int Kept { get; }
+		internal float UnitKg { get; }
+	}
+
+	/// <summary>这一件是不是「整件都留在背包、什么都不搬」（只有这种才需要排到后面）。</summary>
+	private static bool IsFullyKept(GearItem gi, string kind, Dictionary<string, List<KeeperPick>> keepers)
+	{
+		return TryGetKeeper(keepers, kind, gi, out int keepUnits) && keepUnits >= UnitsOf(gi);
 	}
 
 	// ---------------------------------------------------------------- 收集
@@ -1137,6 +1345,51 @@ internal static class ContainerTransfer
 		{
 			return 0f;
 		}
+	}
+
+	/// <summary>
+	/// 剩余容量最多能装下多少份（向下取整，并夹到 maxUnits）。
+	/// 先按浮点算一次再用乘法回验，避免 0.3kg 这类重量除出 133.33… 时多算一份把容器撑爆。
+	/// </summary>
+	private static int FitUnits(float left, float unitKg, int maxUnits)
+	{
+		if (left <= Epsilon || unitKg <= Epsilon || maxUnits <= 0)
+		{
+			return 0;
+		}
+
+		int fit = (int)Math.Floor((left + 1e-4f) / unitKg);
+		if (fit > maxUnits)
+		{
+			fit = maxUnits;
+		}
+
+		while (fit > 0 && fit * unitKg > left + Epsilon)
+		{
+			fit--;
+		}
+
+		return fit;
+	}
+
+	/// <summary>单份重量：一堆 20 支箭按每支摊开，非堆叠就是整件重量。比较「谁更重」用这个。</summary>
+	private static float UnitKilograms(GearItem gi)
+	{
+		float kg = ItemKilograms(gi);
+		try
+		{
+			StackableItem? st = gi.m_StackableItem;
+			if (st != null && st.m_Units > 1 && kg > 0f)
+			{
+				return kg / st.m_Units;
+			}
+		}
+		catch
+		{
+			// 读不到堆叠信息就按整件算
+		}
+
+		return kg;
 	}
 
 	/// <summary>ItemWeight（内部以 long 记账）→ 公斤浮点。</summary>
