@@ -3,13 +3,14 @@ using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(ContainerSorter.ContainerSorterMod), "Container Sorter", "1.9.0", "Hemalurgic")]
+[assembly: MelonInfo(typeof(ContainerSorter.ContainerSorterMod), "Container Sorter", "1.10.0", "Hemalurgic")]
 [assembly: MelonGame("Hinterland", "TheLongDark")]
 
 namespace ContainerSorter;
 
 /// <summary>
-/// 打开容器 → 按整理键（默认 R）→ 背包里与容器重复的物品按容器剩余容量塞进容器。
+/// 打开容器 → 按整理键（默认 R）→ 背包里与容器重复的物品按容器剩余容量塞进容器；
+/// 清单里标了「物品ID*数字」的种类先补齐到 N 份（少了从容器取回，多了搬进容器）。
 /// 键位/开关在 选项 → Mod Settings → Container Sorter 里调（按键是「点一下再按想要的键」式重绑定）。
 /// </summary>
 public class ContainerSorterMod : MelonMod

@@ -9,6 +9,8 @@ namespace ContainerSorter;
 /// 容器整理的核心逻辑：
 /// 容器面板打开时，把背包里「该容器中已经存在的同种物品」逐件搬进容器，
 /// 直到容器剩余容量装不下下一件为止。
+/// 清单里写了 <c>ID*数字</c> 的种类是「目标数量」：背包不够 N 份时由 <see cref="TargetCount"/>
+/// 先从容器取回差额，本类再按「留下 N 份」的规则把多出来的搬进去。
 /// </summary>
 internal static class ContainerTransfer
 {
@@ -48,21 +50,49 @@ internal static class ContainerTransfer
 			return;
 		}
 
-		float capacity = ToKilograms(container.m_Capacity);
-		float used = ToKilograms(container.GetTotalWeightKG());
+		// 忽略清单按修改时间增量重读：改完存盘、下次按键即生效
+		if (cfg.UseIgnoreList)
+		{
+			IgnoreList.Reload(log);
+		}
+
+		// 「目标数量」（ID*数字）先补足背包不够的那部分：容器 → 背包。
+		// 这一步不受容器剩余容量限制（它是在往外取、腾空间），所以必须排在容量判断之前。
+		int pulledUnits = 0;
+		int pulledKinds = 0;
+		if (cfg.UseIgnoreList)
+		{
+			TargetCount.Fill(container, inv, log, cfg, out pulledUnits, out pulledKinds);
+		}
+
+		float capacity = GearMath.ToKilograms(container.m_Capacity);
+		float used = GearMath.ToKilograms(container.GetTotalWeightKG());
 		float remaining = capacity - used;
 
-		log.Msg($"[{ContainerName(container)}] 容量 {capacity:0.##}kg，已用 {used:0.##}kg，剩余 {remaining:0.##}kg");
+		log.Msg($"[{ContainerName(container)}] 容量 {capacity:0.##}kg，已用 {used:0.##}kg，剩余 {remaining:0.##}kg"
+			+ (pulledUnits > 0 ? $"，已从容器取回 {pulledUnits} 份（{pulledKinds} 种）补足目标数量" : string.Empty));
 
 		if (capacity <= 0f)
 		{
-			log.Warning("这个容器容量为 0，原版也不允许存放，跳过。");
+			log.Warning("这个容器容量为 0，原版也不允许存放，跳过搬入。");
+
+			if (pulledUnits > 0)
+			{
+				RefreshPanels(panel, log);
+			}
+
 			return;
 		}
 
 		if (remaining <= Epsilon)
 		{
 			log.Msg("容器已经装满，没有可迁移的空间。");
+
+			if (pulledUnits > 0)
+			{
+				RefreshPanels(panel, log);
+			}
+
 			return;
 		}
 
@@ -70,18 +100,19 @@ internal static class ContainerTransfer
 		if (containerKinds.Count == 0)
 		{
 			log.Msg("容器是空的，没有可以匹配的物品。");
+
+			if (pulledUnits > 0)
+			{
+				RefreshPanels(panel, log); // 取回把容器掏空了，界面还停着旧条目
+			}
+
 			return;
 		}
 
+		// 背包快照放在取回之后拍：刚取回来的份数也要参与后面的保留判断，否则会被当成「背包里少的」再记一遍
 		List<GearItem> stock = CollectInventoryItems(inv, cfg);
 
-		// 忽略清单按修改时间增量重读：改完存盘、下次按键即生效
-		if (cfg.UseIgnoreList)
-		{
-			IgnoreList.Reload(log);
-		}
-
-		// 「保留（至少一个）」的物品先挑出要留在背包的那几个实例（默认 1 个，ID*数字 可指定 N 个）
+		// 「保留（至少一个）」/「目标数量」的物品先挑出要留在背包的那几个实例
 		Dictionary<string, List<KeeperPick>> keepers = cfg.UseIgnoreList
 			? PickKeepers(stock, containerKinds, cfg)
 			: new Dictionary<string, List<KeeperPick>>(StringComparer.OrdinalIgnoreCase);
@@ -105,13 +136,13 @@ internal static class ContainerTransfer
 
 		foreach (GearItem gi in stock)
 		{
-			string? name = SafeName(gi);
+			string? name = GearMath.SafeName(gi);
 			if (name == null)
 			{
 				continue;
 			}
 
-			string kind = NormalizeName(name);
+			string kind = GearMath.NormalizeName(name);
 			if (!containerKinds.Contains(kind))
 			{
 				continue; // 容器里没有这种物品
@@ -153,7 +184,7 @@ internal static class ContainerTransfer
 
 			// keep > 0 表示这一件只搬走一部分，剩下的留在背包
 			int keep = 0;
-			if (rule.Mode == IgnoreMode.KeepOne)
+			if (IsKeepRule(rule.Mode))
 			{
 				bool isKeeper = TryGetKeeper(keepers, kind, gi, out int keeperUnits);
 
@@ -175,8 +206,8 @@ internal static class ContainerTransfer
 					kept++;
 					if (cfg.Verbose)
 					{
-						float cond = Condition(gi);
-						float unit = UnitKilograms(gi);
+						float cond = GearMath.Condition(gi);
+						float unit = GearMath.UnitKilograms(gi);
 						log.Msg($"  = {name} 按「保留」留在背包（{units} 个"
 							+ (cond >= 0f ? $"，耐久 {cond * 100f:0}%" : string.Empty)
 							+ (unit > 0f ? $"，单份 {unit:0.##}kg" : string.Empty) + "）");
@@ -187,11 +218,11 @@ internal static class ContainerTransfer
 			}
 
 			int moveUnits = units - keep;
-			float itemKg = ItemKilograms(gi);
+			float itemKg = GearMath.ItemKilograms(gi);
 			float unitKg = stackable && units > 0 ? itemKg / units : itemKg;
 			float moveKg = keep > 0 ? unitKg * moveUnits : itemKg;
 
-			float left = capacity - ToKilograms(container.GetTotalWeightKG());
+			float left = capacity - GearMath.ToKilograms(container.GetTotalWeightKG());
 
 			if (moveKg > left + Epsilon)
 			{
@@ -264,7 +295,7 @@ internal static class ContainerTransfer
 				failed++;
 			}
 
-			if (capacity - ToKilograms(container.GetTotalWeightKG()) <= Epsilon)
+			if (capacity - GearMath.ToKilograms(container.GetTotalWeightKG()) <= Epsilon)
 			{
 				break; // 满了
 			}
@@ -272,8 +303,9 @@ internal static class ContainerTransfer
 
 		RefreshPanels(panel, log);
 
-		float nowLeft = capacity - ToKilograms(container.GetTotalWeightKG());
+		float nowLeft = capacity - GearMath.ToKilograms(container.GetTotalWeightKG());
 		log.Msg($"整理完成：放入 {moved} 件（{movedKg:0.##}kg）"
+			+ (pulledUnits > 0 ? $"，从容器取回 {pulledUnits} 份（{pulledKinds} 种）" : string.Empty)
 			+ (merged > 0 ? $"，其中 {merged} 件并进已有堆叠" : string.Empty)
 			+ (ignored > 0 ? $"，{ignored} 件按忽略清单跳过" : string.Empty)
 			+ (kept > 0 ? $"，{kept} 件按「保留」留在背包" : string.Empty)
@@ -327,7 +359,17 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 「保留（至少一个）」的每种物品挑出要留在背包的实例。只有容器里也有的种类才参与，其它种类本来就不会被搬。
+	/// 是不是「背包里要留 N 份」类的规则。<see cref="IgnoreMode.KeepOne"/> 与 <see cref="IgnoreMode.SetCount"/>
+	/// 在搬入方向上完全同构（都是「留下 N 份、其余搬走」），差别只在 <see cref="IgnoreMode.SetCount"/> 还会由
+	/// <see cref="TargetCount"/> 补足背包不足的部分。
+	/// </summary>
+	private static bool IsKeepRule(IgnoreMode mode)
+	{
+		return mode == IgnoreMode.KeepOne || mode == IgnoreMode.SetCount;
+	}
+
+	/// <summary>
+	/// 「保留（至少一个）」/「目标数量」的每种物品挑出要留在背包的实例。只有容器里也有的种类才参与，其它种类本来就不会被搬。
 	/// 留几个：清单里写 <c>ID*数字</c> 就是 N 个，不写默认 1 个；堆叠物品按份数累计，够数就停。
 	/// 挑谁留：耐久低的先留（好状态收进容器）；耐久打平 → 单份更轻的先留（重的进容器，主要是肉类）。
 	/// 关掉设置里的「保留时优先把高耐久放进容器」就退回老行为：留状态最好的。
@@ -340,14 +382,14 @@ internal static class ContainerTransfer
 
 		foreach (GearItem gi in stock)
 		{
-			string? name = SafeName(gi);
+			string? name = GearMath.SafeName(gi);
 			if (name == null)
 			{
 				continue;
 			}
 
-			string kind = NormalizeName(name);
-			if (!containerKinds.Contains(kind) || IgnoreList.Lookup(kind).Mode != IgnoreMode.KeepOne)
+			string kind = GearMath.NormalizeName(name);
+			if (!containerKinds.Contains(kind) || !IsKeepRule(IgnoreList.Lookup(kind).Mode))
 			{
 				continue;
 			}
@@ -380,7 +422,7 @@ internal static class ContainerTransfer
 					break;
 				}
 
-				int units = UnitsOf(gi);
+				int units = GearMath.UnitsOf(gi);
 				int take = Math.Min(units, remaining);
 				picks.Add(new KeeperPick(gi, take));
 				remaining -= take;
@@ -433,8 +475,8 @@ internal static class ContainerTransfer
 	/// <summary>排序用：结果为负表示 a 更该留在背包。</summary>
 	private static int CompareKeepPriority(GearItem a, GearItem b, Settings cfg)
 	{
-		float condA = Condition(a);
-		float condB = Condition(b);
+		float condA = GearMath.Condition(a);
+		float condB = GearMath.Condition(b);
 
 		// 读不到耐久（没有 condition 的物品）就跳过耐久比较，直接比重量
 		if (condA >= 0f && condB >= 0f && Math.Abs(condA - condB) > 0.001f)
@@ -444,45 +486,14 @@ internal static class ContainerTransfer
 				: condB.CompareTo(condA);  // 留耐久高的
 		}
 
-		float kgA = UnitKilograms(a);
-		float kgB = UnitKilograms(b);
+		float kgA = GearMath.UnitKilograms(a);
+		float kgB = GearMath.UnitKilograms(b);
 		if (cfg.HeavierFirstWhenEqualCondition && kgA > 0f && kgB > 0f && Math.Abs(kgA - kgB) > 0.0001f)
 		{
 			return kgA.CompareTo(kgB); // 留单份更轻的
 		}
 
-		return InstanceId(a).CompareTo(InstanceId(b));
-	}
-
-	private static int InstanceId(GearItem gi)
-	{
-		try
-		{
-			return gi.m_InstanceID;
-		}
-		catch
-		{
-			return 0;
-		}
-	}
-
-	/// <summary>这一件算几份：堆叠就是 m_Units，非堆叠算 1。</summary>
-	private static int UnitsOf(GearItem gi)
-	{
-		try
-		{
-			StackableItem? st = gi.m_StackableItem;
-			if (st != null && st.m_Units > 0)
-			{
-				return st.m_Units;
-			}
-		}
-		catch
-		{
-			// 读不到就当单件
-		}
-
-		return 1;
+		return GearMath.InstanceId(a).CompareTo(GearMath.InstanceId(b));
 	}
 
 	private static bool IsSameInstance(GearItem a, GearItem b)
@@ -510,15 +521,15 @@ internal static class ContainerTransfer
 
 		foreach (GearItem gi in stock)
 		{
-			string? name = SafeName(gi);
-			string kind = name == null ? "\u0000invalid" : NormalizeName(name);
+			string? name = GearMath.SafeName(gi);
+			string kind = name == null ? "\u0000invalid" : GearMath.NormalizeName(name);
 			if (!groupRank.TryGetValue(kind, out int group))
 			{
 				group = groupRank.Count;
 				groupRank[kind] = group;
 			}
 
-			keyed.Add(new SortEntry(gi, group, IsFullyKept(gi, kind, keepers) ? 1 : 0, UnitKilograms(gi)));
+			keyed.Add(new SortEntry(gi, group, IsFullyKept(gi, kind, keepers) ? 1 : 0, GearMath.UnitKilograms(gi)));
 		}
 
 		keyed.Sort((a, b) =>
@@ -566,7 +577,7 @@ internal static class ContainerTransfer
 	/// <summary>这一件是不是「整件都留在背包、什么都不搬」（只有这种才需要排到后面）。</summary>
 	private static bool IsFullyKept(GearItem gi, string kind, Dictionary<string, List<KeeperPick>> keepers)
 	{
-		return TryGetKeeper(keepers, kind, gi, out int keepUnits) && keepUnits >= UnitsOf(gi);
+		return TryGetKeeper(keepers, kind, gi, out int keepUnits) && keepUnits >= GearMath.UnitsOf(gi);
 	}
 
 	// ---------------------------------------------------------------- 收集
@@ -587,10 +598,10 @@ internal static class ContainerTransfer
 			try
 			{
 				GearItem gi = items[i].m_GearItem;
-				string? name = SafeName(gi);
+				string? name = GearMath.SafeName(gi);
 				if (name != null)
 				{
-					kinds.Add(NormalizeName(name));
+					kinds.Add(GearMath.NormalizeName(name));
 				}
 			}
 			catch
@@ -686,14 +697,14 @@ internal static class ContainerTransfer
 
 	private static bool MoveOne(GearItem gi, Container container, Inventory inv, MelonLogger.Instance log, float itemKg, bool verbose)
 	{
-		string name = SafeName(gi) ?? "(未知物品)";
+		string name = GearMath.SafeName(gi) ?? "(未知物品)";
 
 		int instanceId;
 		float before;
 		try
 		{
 			instanceId = gi.m_InstanceID;
-			before = ToKilograms(container.GetTotalWeightKG());
+			before = GearMath.ToKilograms(container.GetTotalWeightKG());
 		}
 		catch (Exception e)
 		{
@@ -728,7 +739,7 @@ internal static class ContainerTransfer
 		float after;
 		try
 		{
-			after = ToKilograms(container.GetTotalWeightKG());
+			after = GearMath.ToKilograms(container.GetTotalWeightKG());
 		}
 		catch
 		{
@@ -815,8 +826,8 @@ internal static class ContainerTransfer
 					continue;
 				}
 
-				string? targetName = SafeName(target);
-				if (targetName == null || !string.Equals(NormalizeName(targetName), kind, StringComparison.OrdinalIgnoreCase))
+				string? targetName = GearMath.SafeName(target);
+				if (targetName == null || !string.Equals(GearMath.NormalizeName(targetName), kind, StringComparison.OrdinalIgnoreCase))
 				{
 					continue;
 				}
@@ -848,7 +859,7 @@ internal static class ContainerTransfer
 	/// </summary>
 	private static bool MergeInto(GearItem source, GearItem target, Inventory inv, MelonLogger.Instance log, bool verbose)
 	{
-		string name = SafeName(source) ?? "(未知物品)";
+		string name = GearMath.SafeName(source) ?? "(未知物品)";
 
 		int units;
 		int targetUnits;
@@ -871,7 +882,7 @@ internal static class ContainerTransfer
 		float weightBefore;
 		try
 		{
-			weightBefore = ToKilograms(target.GetItemWeightKG(false));
+			weightBefore = GearMath.ToKilograms(target.GetItemWeightKG(false));
 		}
 		catch
 		{
@@ -881,7 +892,7 @@ internal static class ContainerTransfer
 		float expected;
 		try
 		{
-			expected = ToKilograms(source.GetItemWeightKG(false));
+			expected = GearMath.ToKilograms(source.GetItemWeightKG(false));
 		}
 		catch
 		{
@@ -904,7 +915,7 @@ internal static class ContainerTransfer
 		{
 			target.m_StackableItem.m_Units = targetUnits + units;
 			increased = target.m_StackableItem.m_Units == targetUnits + units;
-			weightAfter = ToKilograms(target.GetItemWeightKG(false));
+			weightAfter = GearMath.ToKilograms(target.GetItemWeightKG(false));
 		}
 		catch (Exception e)
 		{
@@ -974,7 +985,7 @@ internal static class ContainerTransfer
 	/// </summary>
 	private static bool MergeUnits(GearItem source, GearItem target, int moveUnits, int keepUnits, MelonLogger.Instance log, bool verbose)
 	{
-		string name = SafeName(source) ?? "(未知物品)";
+		string name = GearMath.SafeName(source) ?? "(未知物品)";
 
 		int sourceUnits;
 		int targetUnits;
@@ -994,8 +1005,8 @@ internal static class ContainerTransfer
 			return false;
 		}
 
-		float targetBefore = SafeWeight(target);
-		float sourceBefore = SafeWeight(source);
+		float targetBefore = GearMath.SafeWeight(target);
+		float sourceBefore = GearMath.SafeWeight(source);
 		float expected = sourceBefore > 0f ? sourceBefore * moveUnits / sourceUnits : 0f;
 
 		bool applied;
@@ -1015,22 +1026,22 @@ internal static class ContainerTransfer
 
 		if (!applied)
 		{
-			RestoreUnits(source, sourceUnits);
-			RestoreUnits(target, targetUnits);
+			GearMath.RestoreUnits(source, sourceUnits);
+			GearMath.RestoreUnits(target, targetUnits);
 			return false;
 		}
 
-		float targetAfter = SafeWeight(target);
-		float sourceAfter = SafeWeight(source);
+		float targetAfter = GearMath.SafeWeight(target);
+		float sourceAfter = GearMath.SafeWeight(source);
 
 		// 容器那边涨的、背包那边掉下来的，都得差不多等于 moveUnits 份的重量
-		bool grew = WeightMatches(targetBefore, targetAfter, expected);
-		bool shrank = WeightMatches(sourceBefore, sourceAfter, -expected);
+		bool grew = GearMath.WeightMatches(targetBefore, targetAfter, expected);
+		bool shrank = GearMath.WeightMatches(sourceBefore, sourceAfter, -expected);
 
 		if (!grew || !shrank)
 		{
-			RestoreUnits(source, sourceUnits);
-			RestoreUnits(target, targetUnits);
+			GearMath.RestoreUnits(source, sourceUnits);
+			GearMath.RestoreUnits(target, targetUnits);
 			log.Warning($"{name} 的堆叠重量没有随数量变化（容器 {targetAfter - targetBefore:+0.###;-0.###;0}kg / 背包 {sourceAfter - sourceBefore:+0.###;-0.###;0}kg，期望 ±{expected:0.###}kg），已回滚。");
 			return false;
 		}
@@ -1049,7 +1060,7 @@ internal static class ContainerTransfer
 	/// </summary>
 	private static bool SplitAndMove(GearItem source, Container container, int moveUnits, int keepUnits, MelonLogger.Instance log, bool verbose)
 	{
-		string name = SafeName(source) ?? "(未知物品)";
+		string name = GearMath.SafeName(source) ?? "(未知物品)";
 
 		int sourceUnits;
 		try
@@ -1089,8 +1100,8 @@ internal static class ContainerTransfer
 			StackableItem? ps = part.m_StackableItem;
 			if (ps == null)
 			{
-				Slay(part);
-				RestoreUnits(source, sourceUnits);
+				GearMath.Slay(part);
+				GearMath.RestoreUnits(source, sourceUnits);
 				log.Warning($"拆出来的 {name} 不是堆叠物品，已放弃。");
 				return false;
 			}
@@ -1098,8 +1109,8 @@ internal static class ContainerTransfer
 			ps.m_Units = moveUnits;
 			if (ps.m_Units != moveUnits)
 			{
-				Slay(part);
-				RestoreUnits(source, sourceUnits);
+				GearMath.Slay(part);
+				GearMath.RestoreUnits(source, sourceUnits);
 				log.Warning($"拆出来的 {name} 数量没设上，已放弃。");
 				return false;
 			}
@@ -1109,12 +1120,12 @@ internal static class ContainerTransfer
 			part.m_IsInSatchel = false;
 
 			int partId = part.m_InstanceID;
-			float partKg = ItemKilograms(part);
-			float before = ToKilograms(container.GetTotalWeightKG());
+			float partKg = GearMath.ItemKilograms(part);
+			float before = GearMath.ToKilograms(container.GetTotalWeightKG());
 
 			container.AddGear(part);
 
-			float after = ToKilograms(container.GetTotalWeightKG());
+			float after = GearMath.ToKilograms(container.GetTotalWeightKG());
 			bool accepted = ContainerHasInstance(container, partId) || after >= before + partKg * 0.5f;
 
 			if (!accepted)
@@ -1128,13 +1139,13 @@ internal static class ContainerTransfer
 					// 忽略
 				}
 
-				Slay(part);
-				RestoreUnits(source, sourceUnits);
+				GearMath.Slay(part);
+				GearMath.RestoreUnits(source, sourceUnits);
 				log.Warning($"容器没有接收拆出来的一份（{name}），已回滚。");
 				return false;
 			}
 
-			RestoreUnits(source, keepUnits);
+			GearMath.RestoreUnits(source, keepUnits);
 
 			if (verbose)
 			{
@@ -1154,80 +1165,10 @@ internal static class ContainerTransfer
 				// 忽略
 			}
 
-			Slay(part);
-			RestoreUnits(source, sourceUnits);
+			GearMath.Slay(part);
+			GearMath.RestoreUnits(source, sourceUnits);
 			log.Error($"拆堆迁移失败（{name}）：{e.Message}");
 			return false;
-		}
-	}
-
-	/// <summary>数量改了以后核对重量变化是否符合预期（预期为负表示应该变轻）。抓不到基准重量就跳过校验。</summary>
-	private static bool WeightMatches(float before, float after, float expected)
-	{
-		if (expected == 0f || before < 0f || after < 0f)
-		{
-			return true;
-		}
-
-		float delta = after - before;
-		float lo = Math.Min(expected * 0.5f, expected * 2f);
-		float hi = Math.Max(expected * 0.5f, expected * 2f);
-
-		return delta >= lo - 0.0001f && delta <= hi + 0.0001f;
-	}
-
-	private static void RestoreUnits(GearItem gi, int units)
-	{
-		try
-		{
-			if (gi != null && gi.m_StackableItem != null)
-			{
-				gi.m_StackableItem.m_Units = units;
-			}
-		}
-		catch
-		{
-			// 忽略
-		}
-	}
-
-	private static void Slay(GearItem gi)
-	{
-		try
-		{
-			if (gi != null)
-			{
-				UnityEngine.Object.Destroy(gi.gameObject);
-			}
-		}
-		catch
-		{
-			// 忽略
-		}
-	}
-
-	/// <summary>物品总重量（kg）；读不到返回 -1，让校验自动跳过。</summary>
-	private static float SafeWeight(GearItem gi)
-	{
-		try
-		{
-			return ToKilograms(gi.GetItemWeightKG(false));
-		}
-		catch
-		{
-			return -1f;
-		}
-	}
-
-	private static float Condition(GearItem gi)
-	{
-		try
-		{
-			return gi.GetNormalizedCondition();
-		}
-		catch
-		{
-			return -1f;
 		}
 	}
 
@@ -1294,23 +1235,6 @@ internal static class ContainerTransfer
 		}
 	}
 
-	private static string? SafeName(GearItem gi)
-	{
-		if (gi == null)
-		{
-			return null;
-		}
-
-		try
-		{
-			return gi.name;
-		}
-		catch
-		{
-			return null;
-		}
-	}
-
 	private static string ContainerName(Container container)
 	{
 		try
@@ -1320,30 +1244,6 @@ internal static class ContainerTransfer
 		catch
 		{
 			return "容器";
-		}
-	}
-
-	/// <summary>Unity 实例名会带 (Clone) 后缀，统一去掉再比较。</summary>
-	private static string NormalizeName(string name)
-	{
-		string n = name.Trim();
-		if (n.EndsWith("(Clone)", StringComparison.Ordinal))
-		{
-			n = n.Substring(0, n.Length - "(Clone)".Length).Trim();
-		}
-
-		return n;
-	}
-
-	private static float ItemKilograms(GearItem gi)
-	{
-		try
-		{
-			return ToKilograms(gi.GetItemWeightKG(false));
-		}
-		catch
-		{
-			return 0f;
 		}
 	}
 
@@ -1370,31 +1270,5 @@ internal static class ContainerTransfer
 		}
 
 		return fit;
-	}
-
-	/// <summary>单份重量：一堆 20 支箭按每支摊开，非堆叠就是整件重量。比较「谁更重」用这个。</summary>
-	private static float UnitKilograms(GearItem gi)
-	{
-		float kg = ItemKilograms(gi);
-		try
-		{
-			StackableItem? st = gi.m_StackableItem;
-			if (st != null && st.m_Units > 1 && kg > 0f)
-			{
-				return kg / st.m_Units;
-			}
-		}
-		catch
-		{
-			// 读不到堆叠信息就按整件算
-		}
-
-		return kg;
-	}
-
-	/// <summary>ItemWeight（内部以 long 记账）→ 公斤浮点。</summary>
-	private static float ToKilograms(ItemWeight weight)
-	{
-		return weight / ItemWeight.FromKilograms(1f);
 	}
 }
