@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using Il2CppTLD.IntBackedUnit;
 using MelonLoader;
@@ -6,19 +6,26 @@ using MelonLoader;
 namespace ContainerSorter;
 
 /// <summary>
-/// 容器整理的核心逻辑：
-/// 容器面板打开时，把背包里「该容器中已经存在的同种物品」逐件搬进容器，
-/// 直到容器剩余容量装不下下一件为止。
-/// 清单里写了 <c>ID*数字</c> 的种类是「目标数量」：背包不够 N 份时由 <see cref="TargetCount"/>
-/// 先从容器取回差额，本类再按「留下 N 份」的规则把多出来的搬进去。
+/// Move-in pass: while a container panel is open, every backpack item whose kind the container already holds is moved in
+/// until the remaining capacity cannot take another unit.
+/// Kinds listed as <c>ID*count</c> are target counts: <see cref="TargetCount"/> takes the shortfall back out first, then
+/// this class moves the surplus in following the same "keep N" rule.
+/// Pipeline and constraints: docs/DEVELOPMENT.md §2 and §10.
 /// </summary>
 internal static class ContainerTransfer
 {
-	/// <summary>kg 比较容差，避免浮点累积误差把刚好装满的物品挡在外面。</summary>
+	/// <summary>kg comparison tolerance, so floating-point drift does not lock out an item that fits exactly.</summary>
 	private const float Epsilon = 0.0005f;
 
 	internal static void Run(MelonLogger.Instance log, Settings cfg)
 	{
+		// The curing box is not a Container and opens Panel_CuringStorage, so it gets its own pass first.
+		// A true result means this key press was handled there and this method must not run.
+		if (CuringBoxTransfer.Run(log, cfg))
+		{
+			return;
+		}
+
 		Panel_Container panel;
 		try
 		{
@@ -30,7 +37,7 @@ internal static class ContainerTransfer
 			return;
 		}
 
-		// 容器面板没开 → 什么都不做（不提示，避免每次按 R 都刷日志）
+		// No container panel open: do nothing and stay silent, otherwise every key press writes a log line
 		if (panel == null || !SafeIsEnabled(panel))
 		{
 			return;
@@ -50,14 +57,14 @@ internal static class ContainerTransfer
 			return;
 		}
 
-		// 忽略清单按修改时间增量重读：改完存盘、下次按键即生效
+		// The list reloads itself when its timestamp changes: save the file, press the key again
 		if (cfg.UseIgnoreList)
 		{
 			IgnoreList.Reload(log);
 		}
 
-		// 「目标数量」（ID*数字）先补足背包不够的那部分：容器 → 背包。
-		// 这一步不受容器剩余容量限制（它是在往外取、腾空间），所以必须排在容量判断之前。
+		// Target counts first: take the missing units back out of the container.
+		// This runs before the capacity check because taking items out frees space instead of using it.
 		int pulledUnits = 0;
 		int pulledKinds = 0;
 		if (cfg.UseIgnoreList)
@@ -109,17 +116,16 @@ internal static class ContainerTransfer
 			return;
 		}
 
-		// 背包快照放在取回之后拍：刚取回来的份数也要参与后面的保留判断，否则会被当成「背包里少的」再记一遍
+		// Snapshot the backpack after the top-up, so the units just taken back count against the keep rule instead of being taken twice
 		List<GearItem> stock = CollectInventoryItems(inv, cfg);
 
-		// 「保留（至少一个）」/「目标数量」的物品先挑出要留在背包的那几个实例
+		// Pick which instances of a "keep N" kind stay in the backpack before anything moves
 		Dictionary<string, List<KeeperPick>> keepers = cfg.UseIgnoreList
 			? PickKeepers(stock, containerKinds, cfg)
 			: new Dictionary<string, List<KeeperPick>>(StringComparer.OrdinalIgnoreCase);
 
-		// 迁移顺序：同一类物品里「整件要搬走的」排在「留在背包的」前面，
-		// 同类内每份更重的先搬 —— 容器剩余空间只够一部分时，先塞进去的是重的那几块肉。
-		// 不同种类之间的先后保持背包原序。
+		// Move order: fully moved items before the ones staying behind, heavier units first within a kind, so a nearly
+		// full container takes the heavy pieces. Kinds keep their backpack order.
 		if (cfg.HeavierFirstWhenEqualCondition)
 		{
 			stock = OrderForTransfer(stock, keepers);
@@ -145,7 +151,7 @@ internal static class ContainerTransfer
 			string kind = GearMath.NormalizeName(name);
 			if (!containerKinds.Contains(kind))
 			{
-				continue; // 容器里没有这种物品
+				continue; // The container holds no item of this kind
 			}
 
 			IgnoreRule rule = cfg.UseIgnoreList ? IgnoreList.Lookup(kind) : IgnoreRule.None;
@@ -182,7 +188,7 @@ internal static class ContainerTransfer
 				continue;
 			}
 
-			// keep > 0 表示这一件只搬走一部分，剩下的留在背包
+			// A positive keep means part of this instance stays in the backpack
 			int keep = 0;
 			if (IsKeepRule(rule.Mode))
 			{
@@ -190,11 +196,11 @@ internal static class ContainerTransfer
 
 				if (!isKeeper)
 				{
-					keep = 0; // 同类里不需要留的那些整件搬走
+					keep = 0; // Nothing of this kind has to stay, so the whole instance moves
 				}
 				else if (!stackable)
 				{
-					keep = 1; // 非堆叠物品：这一件本身留着
+					keep = 1; // Not a stack: this very instance is the one that stays
 				}
 				else
 				{
@@ -213,7 +219,7 @@ internal static class ContainerTransfer
 							+ (unit > 0f ? $"，单份 {unit:0.##}kg" : string.Empty) + "）");
 					}
 
-					continue; // 没得搬
+					continue; // Nothing left to move
 				}
 			}
 
@@ -226,9 +232,9 @@ internal static class ContainerTransfer
 
 			if (moveKg > left + Epsilon)
 			{
-				// 整组塞不下：能拆堆的就按剩余容量拆出一部分先搬，剩下的留在背包。
-				// 只有「连一份都放不下」才真跳过 —— 100 张狼皮在 40kg 余量里能塞几十张，
-				// 不能因为整组 50kg 就直接一张都不搬。
+				// The whole stack does not fit: move the part that does and leave the rest behind.
+				// Only "not even one unit fits" is a real skip — 100 pelts weighing 50kg must still give up the
+				// dozens that fit into 40kg of room.
 				int fitUnits = stackable ? FitUnits(left, unitKg, moveUnits) : 0;
 
 				if (fitUnits <= 0)
@@ -247,7 +253,7 @@ internal static class ContainerTransfer
 					log.Msg($"  剩余 {left:0.###}kg 只够 {fitUnits}/{units} 份（共 {moveKg:0.###}kg），先搬这些");
 				}
 
-				keep = units - fitUnits;   // 装不下的部分继续留在背包
+				keep = units - fitUnits;   // Whatever does not fit stays behind
 				moveUnits = fitUnits;
 				moveKg = unitKg * moveUnits;
 				partialMoves++;
@@ -258,8 +264,8 @@ internal static class ContainerTransfer
 
 			if (keep > 0)
 			{
-				// 只搬一部分：先试并进容器里已有的那一堆（source 本身就留在背包，只改数量），
-				// 容器里没有可合并的堆就拆出一份新对象放进去。
+				// Partial move: merge into an existing container stack when possible (the source stays in the backpack and
+				// only its unit count changes), otherwise split off a new instance.
 				GearItem? mergeTarget = cfg.MergeStacks ? FindMergeTarget(container, gi, kind) : null;
 				if (mergeTarget != null)
 				{
@@ -276,7 +282,7 @@ internal static class ContainerTransfer
 					mergedNow = MergeInto(gi, mergeTarget, inv, log, cfg.Verbose);
 				}
 
-				// 没得合 / 合并不成（比如重量账本不跟数量走）→ 退回常规迁移，至少东西能进容器
+				// Nothing to merge with, or merging failed (the weight ledger ignores units): fall back to a plain move
 				ok = mergedNow || MoveOne(gi, container, inv, log, itemKg, cfg.Verbose);
 			}
 
@@ -297,7 +303,7 @@ internal static class ContainerTransfer
 
 			if (capacity - GearMath.ToKilograms(container.GetTotalWeightKG()) <= Epsilon)
 			{
-				break; // 满了
+				break; // Full
 			}
 		}
 
@@ -316,13 +322,10 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 迁完刷新物品栏。本 mod 直接改数据、绕过了原版的 OnMoveItem 流程，
-	/// 面板里的过滤列表和选中项还停在旧条目上，所以三件事都做：
-	///   1. RefreshTables   —— 立刻重建容器表 + 背包表
-	///   2. ForceRefresh    —— 置一次「强制重建」标记，下一帧 Update 会重算过滤列表/选中项
-	///                        （只做 1 时，某些情况下会残留已经搬走的条目）
-	///   3. Panel_Inventory.RefreshTable —— 背包面板自己的格子与负重显示
-	/// 每一步单独 try：任何一步不可用都不影响其它两步，也不影响已经完成的迁移。
+	/// Refreshes the panels after moving: rebuild the tables, request a forced refresh for the next frame, then refresh the
+	/// inventory panel when it is open. This mod edits data directly, so vanilla never runs its own move handler and the
+	/// filter lists keep showing moved items. Each step is guarded on its own, so one failure cannot undo the moves.
+	/// Details: docs/DEVELOPMENT.md §6.4.
 	/// </summary>
 	private static void RefreshPanels(Panel_Container panel, MelonLogger.Instance log)
 	{
@@ -359,22 +362,22 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 是不是「背包里要留 N 份」类的规则。<see cref="IgnoreMode.KeepOne"/> 与 <see cref="IgnoreMode.SetCount"/>
-	/// 在搬入方向上完全同构（都是「留下 N 份、其余搬走」），差别只在 <see cref="IgnoreMode.SetCount"/> 还会由
-	/// <see cref="TargetCount"/> 补足背包不足的部分。
+	/// True for rules that keep N units in the backpack. <see cref="IgnoreMode.KeepOne"/> and <see cref="IgnoreMode.SetCount"/>
+	/// are identical on the move-in side; only <see cref="IgnoreMode.SetCount"/> also has its shortfall filled by
+	/// <see cref="TargetCount"/>.
 	/// </summary>
-	private static bool IsKeepRule(IgnoreMode mode)
+	internal static bool IsKeepRule(IgnoreMode mode)
 	{
 		return mode == IgnoreMode.KeepOne || mode == IgnoreMode.SetCount;
 	}
 
 	/// <summary>
-	/// 「保留（至少一个）」/「目标数量」的每种物品挑出要留在背包的实例。只有容器里也有的种类才参与，其它种类本来就不会被搬。
-	/// 留几个：清单里写 <c>ID*数字</c> 就是 N 个，不写默认 1 个；堆叠物品按份数累计，够数就停。
-	/// 挑谁留：耐久低的先留（好状态收进容器）；耐久打平 → 单份更轻的先留（重的进容器，主要是肉类）。
-	/// 关掉设置里的「保留时优先把高耐久放进容器」就退回老行为：留状态最好的。
+	/// Chooses the instances that stay in the backpack for each "keep N" kind that the container also holds.
+	/// N comes from the list (<c>ID*N</c>, default 1) and stacks count by unit until N is reached.
+	/// Lowest condition stays first, then the lighter unit, so good and heavy pieces end up stored.
+	/// Turning the "keep the best in the container" setting off reverts to keeping the best piece instead.
 	/// </summary>
-	private static Dictionary<string, List<KeeperPick>> PickKeepers(List<GearItem> stock, HashSet<string> containerKinds, Settings cfg)
+	internal static Dictionary<string, List<KeeperPick>> PickKeepers(List<GearItem> stock, HashSet<string> containerKinds, Settings cfg)
 	{
 		var result = new Dictionary<string, List<KeeperPick>>(StringComparer.OrdinalIgnoreCase);
 		var candidates = new Dictionary<string, List<GearItem>>(StringComparer.OrdinalIgnoreCase);
@@ -409,7 +412,7 @@ internal static class ContainerTransfer
 			List<GearItem> list = candidates[kind];
 			int need = Math.Max(1, IgnoreList.Lookup(kind).KeepCount);
 
-			// 越靠前越该留在背包：耐久低 → 单份轻 → 实例 ID（保证每次结果一致）
+			// Earlier means more likely to stay: low condition, then light unit, then instance id for a stable result
 			list.Sort((a, b) => CompareKeepPriority(a, b, cfg));
 
 			var picks = new List<KeeperPick>();
@@ -437,8 +440,8 @@ internal static class ContainerTransfer
 		return result;
 	}
 
-	/// <summary>留在背包的一件/一堆，以及从它身上留几份。</summary>
-	private readonly struct KeeperPick
+	/// <summary>An instance that stays in the backpack and how many of its units stay.</summary>
+	internal readonly struct KeeperPick
 	{
 		internal KeeperPick(GearItem item, int keepUnits)
 		{
@@ -451,7 +454,7 @@ internal static class ContainerTransfer
 		internal int KeepUnits { get; }
 	}
 
-	private static bool TryGetKeeper(Dictionary<string, List<KeeperPick>> keepers, string kind, GearItem gi, out int keepUnits)
+	internal static bool TryGetKeeper(Dictionary<string, List<KeeperPick>> keepers, string kind, GearItem gi, out int keepUnits)
 	{
 		keepUnits = 0;
 
@@ -472,25 +475,25 @@ internal static class ContainerTransfer
 		return false;
 	}
 
-	/// <summary>排序用：结果为负表示 a 更该留在背包。</summary>
+	/// <summary>Sort helper: a negative result means <c>a</c> should stay in the backpack.</summary>
 	private static int CompareKeepPriority(GearItem a, GearItem b, Settings cfg)
 	{
 		float condA = GearMath.Condition(a);
 		float condB = GearMath.Condition(b);
 
-		// 读不到耐久（没有 condition 的物品）就跳过耐久比较，直接比重量
+		// No condition to compare (items without durability): fall through to weight
 		if (condA >= 0f && condB >= 0f && Math.Abs(condA - condB) > 0.001f)
 		{
 			return cfg.KeepBestInContainer
-				? condA.CompareTo(condB)   // 留耐久低的
-				: condB.CompareTo(condA);  // 留耐久高的
+				? condA.CompareTo(condB)   // keep the lowest condition
+				: condB.CompareTo(condA);  // keep the highest condition
 		}
 
 		float kgA = GearMath.UnitKilograms(a);
 		float kgB = GearMath.UnitKilograms(b);
 		if (cfg.HeavierFirstWhenEqualCondition && kgA > 0f && kgB > 0f && Math.Abs(kgA - kgB) > 0.0001f)
 		{
-			return kgA.CompareTo(kgB); // 留单份更轻的
+			return kgA.CompareTo(kgB); // keep the lighter unit
 		}
 
 		return GearMath.InstanceId(a).CompareTo(GearMath.InstanceId(b));
@@ -509,12 +512,10 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 重排迁移顺序（同类分组的稳定排序）：
-	///   1. 整件要搬走的排在「按保留留在背包」的前面，免得先占空间的是不搬的那件；
-	///   2. 同类内按**单份重量**从重到轻，容器剩余空间不够时先塞进去的是重的那几块肉；
-	///   3. 不同种类之间保持背包原序。
+	/// Stable reorder inside each kind: fully moved items first, then heavier units, kinds keep their backpack order.
+	/// Without it a kept item can take the space a moved item would have used.
 	/// </summary>
-	private static List<GearItem> OrderForTransfer(List<GearItem> stock, Dictionary<string, List<KeeperPick>> keepers)
+	internal static List<GearItem> OrderForTransfer(List<GearItem> stock, Dictionary<string, List<KeeperPick>> keepers)
 	{
 		var groupRank = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 		var keyed = new List<SortEntry>(stock.Count);
@@ -546,7 +547,7 @@ internal static class ContainerTransfer
 				return c;
 			}
 
-			return b.UnitKg.CompareTo(a.UnitKg); // 重的在前
+			return b.UnitKg.CompareTo(a.UnitKg); // Heaviest first
 		});
 
 		var ordered = new List<GearItem>(keyed.Count);
@@ -574,15 +575,15 @@ internal static class ContainerTransfer
 		internal float UnitKg { get; }
 	}
 
-	/// <summary>这一件是不是「整件都留在背包、什么都不搬」（只有这种才需要排到后面）。</summary>
+	/// <summary>True when the whole instance stays behind; only those have to be sorted last.</summary>
 	private static bool IsFullyKept(GearItem gi, string kind, Dictionary<string, List<KeeperPick>> keepers)
 	{
 		return TryGetKeeper(keepers, kind, gi, out int keepUnits) && keepUnits >= GearMath.UnitsOf(gi);
 	}
 
-	// ---------------------------------------------------------------- 收集
+	// ---------------------------------------------------------------- Collection
 
-	/// <summary>容器里现有物品的种类集合（按去掉 (Clone) 后的 prefab 名比较）。</summary>
+	/// <summary>Kinds already in the container, compared by prefab name with the (Clone) suffix removed.</summary>
 	private static HashSet<string> CollectContainerKinds(Container container)
 	{
 		var kinds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -606,15 +607,15 @@ internal static class ContainerTransfer
 			}
 			catch
 			{
-				// 单个条目拿不到就跳过，不影响其它条目
+				// One unreadable entry must not abort the scan
 			}
 		}
 
 		return kinds;
 	}
 
-	/// <summary>背包快照。先拍下来再迁移，避免边遍历边改集合。</summary>
-	private static List<GearItem> CollectInventoryItems(Inventory inv, Settings cfg)
+	/// <summary>Backpack snapshot, taken before moving so the collection is not modified while it is walked.</summary>
+	internal static List<GearItem> CollectInventoryItems(Inventory inv, Settings cfg)
 	{
 		var result = new List<GearItem>();
 
@@ -637,7 +638,7 @@ internal static class ContainerTransfer
 			}
 			catch
 			{
-				// 主菜单/加载瞬间没有 PlayerManager，忽略
+				// No PlayerManager at the main menu or during loading
 			}
 		}
 
@@ -651,7 +652,7 @@ internal static class ContainerTransfer
 					continue;
 				}
 
-				// 水分/燃料这类特殊 supply 不参与，避免把内部虚拟物品搬来搬去
+				// Water and fuel supplies are internal stand-ins and must not be moved around
 				if (gi.m_WaterSupply != null)
 				{
 					continue;
@@ -686,14 +687,14 @@ internal static class ContainerTransfer
 			}
 			catch
 			{
-				// 单件拿不到就跳过
+				// Skip the instance, keep the rest
 			}
 		}
 
 		return result;
 	}
 
-	// ---------------------------------------------------------------- 迁移
+	// ---------------------------------------------------------------- Move-in actions
 
 	private static bool MoveOne(GearItem gi, Container container, Inventory inv, MelonLogger.Instance log, float itemKg, bool verbose)
 	{
@@ -712,7 +713,7 @@ internal static class ContainerTransfer
 			return false;
 		}
 
-		// 1) 先从背包摘下来（toContainer = true：不销毁、交给容器接手）
+		// 1) Detach from the backpack (toContainer = true: keep the object alive for the container)
 		try
 		{
 			inv.RemoveGear(gi.gameObject, true);
@@ -723,7 +724,7 @@ internal static class ContainerTransfer
 			return false;
 		}
 
-		// 2) 再挂到容器上（AddGear 内部会处理同类堆叠合并）
+		// 2) Hand it to the container; AddGear does not merge stacks, that is FindMergeTarget's job
 		try
 		{
 			container.AddGear(gi);
@@ -735,7 +736,7 @@ internal static class ContainerTransfer
 			return false;
 		}
 
-		// 3) 校验：物品要么出现在容器列表里，要么把容器总重顶上去了（说明并进了已有堆叠）
+		// 3) Verify: the instance shows up in the container list, or the container weight rose by one item
 		float after;
 		try
 		{
@@ -756,7 +757,7 @@ internal static class ContainerTransfer
 			return false;
 		}
 
-		// 兜底：万一 RemoveGear 没把「在背包里」的标记清掉，会变成两边各一份
+		// Safety net: a stale in-inventory flag would leave a copy on both sides
 		try
 		{
 			if (gi != null && gi.m_InPlayerInventory)
@@ -767,7 +768,7 @@ internal static class ContainerTransfer
 		}
 		catch
 		{
-			// 已被并进容器里的同款堆叠（对象已销毁）时会走到这里，属正常
+			// Expected when the object was merged into a container stack and destroyed
 		}
 
 		if (verbose)
@@ -778,11 +779,11 @@ internal static class ContainerTransfer
 		return true;
 	}
 
-	// ---------------------------------------------------------------- 堆叠合并
+	// ---------------------------------------------------------------- Stack merging
 
 	/// <summary>
-	/// 在容器里找一坨能和 source 并成同一堆的堆叠。找不到返回 null（那就按常规搬过去，落成新的一堆）。
-	/// 判定：同 prefab 种类 + 都是真堆叠 + 非液体 + 状态（condition）差值在原版允许范围内。
+	/// Finds a container stack the source can join, or null when the source has to land as a stack of its own.
+	/// Same kind, both real stacks, no liquid, and a condition gap inside the vanilla limit.
 	/// </summary>
 	private static GearItem? FindMergeTarget(Container container, GearItem source, string kind)
 	{
@@ -791,7 +792,7 @@ internal static class ContainerTransfer
 			StackableItem srcStack = source.m_StackableItem;
 			if (srcStack == null || srcStack.m_Units <= 0 || source.m_LiquidItem != null)
 			{
-				return null; // 不是堆叠物品；液体按体积记账，不掺和
+				return null; // Not a stack; liquids are accounted by volume and stay out of this
 			}
 
 			float maxDiff = srcStack.m_StackConditionDifferenceConstraint;
@@ -854,8 +855,8 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 把 source 那一堆的数量并进容器里已存在的 target 那一堆，然后销毁 source。
-	/// 走的是和普通迁移同一条「先移出背包」的路子，所以不会在容器里留下两个同款堆。
+	/// Merges the source stack into an existing container stack and destroys the source. It detaches from the backpack
+	/// first, the same way a plain move does, so the container never ends up with two stacks of one kind.
 	/// </summary>
 	private static bool MergeInto(GearItem source, GearItem target, Inventory inv, MelonLogger.Instance log, bool verbose)
 	{
@@ -924,9 +925,8 @@ internal static class ContainerTransfer
 			weightAfter = weightBefore;
 		}
 
-		// 数量涨了，重量必须跟着涨「差不多一件物品那么多」：
-		// 完全不涨 = 重量账本不看 m_Units；涨太多 = 重量已经含数量、再乘一次就重复计数。
-		// 两种情况都说明不能硬来，回滚数量后走普通迁移（落成独立一堆）。
+		// Units went up, so weight must rise by about one item: no change means the ledger ignores m_Units, a much larger
+		// jump means units were already counted. Both cases roll back and move the item as its own stack.
 		bool weightTracks;
 		if (weightBefore < 0f || expected <= 0.0001f)
 		{
@@ -944,11 +944,11 @@ internal static class ContainerTransfer
 			{
 				try
 				{
-					target.m_StackableItem.m_Units = targetUnits; // 回滚数量
+					target.m_StackableItem.m_Units = targetUnits; // Restore the unit count
 				}
 				catch
 				{
-					// 忽略
+					// Best effort
 				}
 
 				log.Warning($"{name} 的堆叠重量和数量对不上（应该 +{expected:0.###}kg，实际 +{weightAfter - weightBefore:0.###}kg），已回滚，改为单独放一堆。");
@@ -958,7 +958,7 @@ internal static class ContainerTransfer
 			return false;
 		}
 
-		// 数量已经转过去了，source 没有别处引用，直接销毁，避免容器里多出一堆
+		// The units now live in the target, so the emptied source can go
 		try
 		{
 			UnityEngine.Object.Destroy(source.gameObject);
@@ -976,12 +976,12 @@ internal static class ContainerTransfer
 		return true;
 	}
 
-	// ---------------------------------------------------------------- 保留下限（只搬一部分）
+	// ---------------------------------------------------------------- Partial move with a keep count
 
 	/// <summary>
-	/// 只把 moveUnits 个并进容器已有的那一堆，source 仍然留在背包里、数量降到 keepUnits。
-	/// 全程不碰背包的增删接口（物品本来就在背包里），只改两边的 m_Units，是最安全的一条路。
-	/// 任意一步校验不过就双向回滚，返回 false 交给调用方换别的办法。
+	/// Moves <c>moveUnits</c> units into an existing container stack while the source stays in the backpack at
+	/// <c>keepUnits</c>. Only <c>m_Units</c> changes on both sides and the backpack API is never touched, which is the
+	/// safest path. Any failed check rolls both sides back and returns false so the caller can try another route.
 	/// </summary>
 	private static bool MergeUnits(GearItem source, GearItem target, int moveUnits, int keepUnits, MelonLogger.Instance log, bool verbose)
 	{
@@ -1034,7 +1034,7 @@ internal static class ContainerTransfer
 		float targetAfter = GearMath.SafeWeight(target);
 		float sourceAfter = GearMath.SafeWeight(source);
 
-		// 容器那边涨的、背包那边掉下来的，都得差不多等于 moveUnits 份的重量
+		// The container must gain and the backpack lose roughly the weight of those units
 		bool grew = GearMath.WeightMatches(targetBefore, targetAfter, expected);
 		bool shrank = GearMath.WeightMatches(sourceBefore, sourceAfter, -expected);
 
@@ -1055,8 +1055,8 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 容器里没有可合并的堆叠时：从 source 拆出一份 moveUnits 的新对象放进容器，source 留在背包里只剩 keepUnits。
-	/// 拆堆用 <c>GearItem.InstantiateStackable</c>（复制自身，不走 prefab 加载，避开 bundle 阻塞那类坑）。
+	/// With no container stack to merge into: split <c>moveUnits</c> units off the source into the container and leave the
+	/// source at <c>keepUnits</c>. Uses <c>GearItem.InstantiateStackable</c>, which clones the item instead of loading its prefab.
 	/// </summary>
 	private static bool SplitAndMove(GearItem source, Container container, int moveUnits, int keepUnits, MelonLogger.Instance log, bool verbose)
 	{
@@ -1115,7 +1115,7 @@ internal static class ContainerTransfer
 				return false;
 			}
 
-			// 复制出来的对象会带着原件的背包标记，进容器前清掉
+			// The clone inherits the source's backpack flags, clear them before it enters the container
 			part.m_InPlayerInventory = false;
 			part.m_IsInSatchel = false;
 
@@ -1136,7 +1136,7 @@ internal static class ContainerTransfer
 				}
 				catch
 				{
-					// 忽略
+					// Best effort
 				}
 
 				GearMath.Slay(part);
@@ -1162,7 +1162,7 @@ internal static class ContainerTransfer
 			}
 			catch
 			{
-				// 忽略
+				// Best effort
 			}
 
 			GearMath.Slay(part);
@@ -1183,7 +1183,7 @@ internal static class ContainerTransfer
 
 			if (gi.m_InPlayerInventory)
 			{
-				return; // 本来还在背包里，别重复加
+				return; // Already in the backpack; adding again would duplicate it
 			}
 
 			inv.AddGear(gi, false);
@@ -1215,13 +1215,13 @@ internal static class ContainerTransfer
 		}
 		catch
 		{
-			// 忽略
+			// Best effort
 		}
 
 		return false;
 	}
 
-	// ---------------------------------------------------------------- 工具
+	// ---------------------------------------------------------------- Helpers
 
 	private static bool SafeIsEnabled(Panel_Container panel)
 	{
@@ -1248,8 +1248,8 @@ internal static class ContainerTransfer
 	}
 
 	/// <summary>
-	/// 剩余容量最多能装下多少份（向下取整，并夹到 maxUnits）。
-	/// 先按浮点算一次再用乘法回验，避免 0.3kg 这类重量除出 133.33… 时多算一份把容器撑爆。
+	/// Units that fit into the remaining capacity, floored and clamped to <c>maxUnits</c>. The float division is re-checked
+	/// by multiplication, because 0.3 kg divides into 133.33 and rounding up would overfill the container.
 	/// </summary>
 	private static int FitUnits(float left, float unitKg, int maxUnits)
 	{

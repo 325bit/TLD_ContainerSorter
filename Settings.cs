@@ -25,6 +25,10 @@ internal class Settings : JsonModSettings
 	[Description("穿在身上的衣物、手上拿的物品不迁移（强烈建议保持开启，否则等于强制脱装备）。")]
 	public bool SkipEquipped = true;
 
+	[Name("支持腌肉盒")]
+	[Description("开启后打开腌肉盒按整理键也生效：把背包里与盒中同种的物品按盒子剩余容量放进去。盐仓的重量单独计算，不占肉的空间；腌肉盒按整件收纳，成叠物品会跳过。")]
+	public bool UseCuringBox = true;
+
 	[Name("跳过小背包里的物品")]
 	[Description("放在随身小包（satchel）里的物品不迁移，免得把包内层级搞乱。")]
 	public bool SkipSatchel = true;
@@ -45,7 +49,7 @@ internal class Settings : JsonModSettings
 	[Description("每次触发都把逐件迁移明细写进 MelonLoader 日志，排查问题时打开。")]
 	public bool Verbose = false;
 
-	/// <summary>旧版 json 里存的是 SortKey 的 0，读进来会变成 KeyCode.None（等于没绑键）。</summary>
+	/// <summary>JSON written with the old enum stores 0, which deserialises to <see cref="KeyCode.None"/> — an unbound key.</summary>
 	internal KeyCode EffectiveKey
 	{
 		get

@@ -6,21 +6,21 @@ using MelonLoader;
 
 namespace ContainerSorter;
 
-/// <summary>清单里一条物品 ID 的处理方式。</summary>
+/// <summary>How one item ID from the list is handled.</summary>
 internal enum IgnoreMode
 {
-	/// <summary>不在清单里，正常迁移。</summary>
+	/// <summary>Not listed: move normally.</summary>
 	None = 0,
 
-	/// <summary>全部无视：一个都不搬。</summary>
+	/// <summary>Ignore all: never move it.</summary>
 	IgnoreAll = 1,
 
-	/// <summary>保留（至少一个）：背包留 keepCount 个，其余搬进容器；背包不够也绝不去容器里拿。</summary>
+	/// <summary>Keep at least N: leave N units in the backpack and move the rest in, but never take any back out.</summary>
 	KeepOne = 2,
 
 	/// <summary>
-	/// 目标数量（<c>物品ID*数字</c>）：背包里该物品保持 keepCount 份。
-	/// 多了按「保留」的逻辑搬进容器，少了从容器取回来 —— 这是与 <see cref="KeepOne"/> 的唯一区别。
+	/// Target count (<c>ID*count</c>): keep exactly N units in the backpack.
+	/// A surplus moves in like <see cref="KeepOne"/>; a shortfall is taken back out — the only difference between the two modes.
 	/// </summary>
 	SetCount = 3,
 }
@@ -41,32 +41,27 @@ internal readonly struct IgnoreRule
 }
 
 /// <summary>
-/// Mods\ContainerSorterIgnore.txt 里的物品规则。
-/// 文件按行分隔，每行一个物品 ID（prefab 名）；# 或 // 开头为注释。
-/// 条目可以带「ID*数字」后缀：
-///   带数字 = 目标数量，背包里保持 N 份 —— 多了搬进容器，少了从容器取回；
-///   不带数字 = 老行为，背包至少留 1 个，只往外搬。
-/// 分隔符用 * 而不是 #，因为 # 本身就是注释符号，两者混在一起会有歧义。
-/// 整行只写分区标记的注释会切换后面的处理方式：
-///   #全部无视/Ignore All                → 之后列出的物品永不搬进容器（文件开头默认就是这个模式）
-///   #保留（至少一个）/Keep At Least One → 之后列出的物品背包至少留 1 个，其余搬进容器
-/// 每次整理前按文件修改时间判断是否需要重读，所以改完存盘、下次按键就生效，不用重启。
+/// Item rules read from Mods\ContainerSorterIgnore.txt: one item ID (prefab name) per line, # or // starts a comment.
+/// A trailing <c>*N</c> means a target count, a bare ID means "keep at least one, only move outward".
+/// Comments that contain nothing but a section marker switch the mode for the lines below them
+/// (Ignore All / Keep At Least One); entries before the first marker default to Ignore All.
+/// The file is re-read when its timestamp changes, so a saved edit applies on the next key press.
+/// Parsing rules and pitfalls: docs/DEVELOPMENT.md §7.
 /// </summary>
 internal static class IgnoreList
 {
 	internal const string FileName = "ContainerSorterIgnore.txt";
 
-	/// <summary>份数后缀的最大值，防止手滑写出天文数字。</summary>
+	/// <summary>Upper bound for a count suffix, so a typo cannot ask for a million units.</summary>
 	private const int MaxKeepCount = 999;
 
 	/// <summary>
-	/// 目标数量分隔符。<c>GEAR_X*4</c> 表示背包里保持 4 份（多了搬进容器，少了从容器取回）。
-	/// 用 <c>*</c> 而不是 <c>#</c>：<c>#</c> 本身就是注释符号，两者放一起会有歧义
-	/// （例如 <c>GEAR_X # 4 个备用</c> 到底是份数还是注释）。
+	/// Target-count separator: <c>GEAR_X*4</c> keeps 4 units in the backpack.
+	/// It cannot be <c>#</c>, which already starts a comment and makes "count or note?" ambiguous.
 	/// </summary>
 	private const char Separator = '*';
 
-	/// <summary>首次运行写出来的模板：全部是注释，等于默认不忽略任何东西。</summary>
+	/// <summary>First-run template: comments only, so nothing is ignored until the player edits it.</summary>
 	private const string Template =
 		"# Container Sorter 忽略清单 / Ignore List\r\n" +
 		"# ==================================================================\r\n" +
@@ -101,8 +96,8 @@ internal static class IgnoreList
 	private static readonly Dictionary<string, IgnoreRule> rules = new(StringComparer.OrdinalIgnoreCase);
 
 	/// <summary>
-	/// 「目标数量」规则（<c>物品ID*数字</c>），键是归一化后的 prefab 名。与 <see cref="rules"/> 分开存两份的原因：
-	/// 这里要按种类挨个核对背包份数，混进 <c>GEAR_</c> 去前缀的别名会让同一条规则被处理两次。
+	/// Target-count rules keyed by normalised prefab name. Kept apart from <see cref="rules"/> because these entries are
+	/// walked kind by kind, where a <c>GEAR_</c>-less alias would make the same rule run twice.
 	/// </summary>
 	private static readonly Dictionary<string, int> targets = new(StringComparer.OrdinalIgnoreCase);
 
@@ -112,15 +107,15 @@ internal static class IgnoreList
 	private static int ignoreCount;
 	private static int keepCount;
 
-	/// <summary>清单文件的完整路径（Mods\ContainerSorterIgnore.txt）。</summary>
+	/// <summary>Full path of the list (Mods\ContainerSorterIgnore.txt).</summary>
 	internal static string FilePath => Path.Combine(DirectoryPath(), FileName);
 
 	internal static int Count => ignoreCount + keepCount;
 
-	/// <summary>「目标数量」规则，只读遍历用（<c>kind → 目标份数</c>）。</summary>
+	/// <summary>Target-count rules for read-only iteration (<c>kind → units</c>).</summary>
 	internal static IReadOnlyDictionary<string, int> Targets => targets;
 
-	/// <summary>启动时调用：文件不存在就按模板创建一个。</summary>
+	/// <summary>Called on startup: writes the template when the file does not exist yet.</summary>
 	internal static void EnsureFile(MelonLogger.Instance log)
 	{
 		try
@@ -144,7 +139,7 @@ internal static class IgnoreList
 		}
 	}
 
-	/// <summary>按修改时间增量重读；文件没变就直接返回，代价只有一次 stat。</summary>
+	/// <summary>Reloads only when the timestamp changed, so a run that changes nothing costs one stat call.</summary>
 	internal static void Reload(MelonLogger.Instance log, bool force = false)
 	{
 		try
@@ -174,7 +169,7 @@ internal static class IgnoreList
 
 			var next = new Dictionary<string, IgnoreRule>(StringComparer.OrdinalIgnoreCase);
 			var primaries = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-			IgnoreMode mode = IgnoreMode.IgnoreAll; // 第一个标记之前按老行为：全部无视
+			IgnoreMode mode = IgnoreMode.IgnoreAll; // Before the first marker, entries default to Ignore All
 			int modeKeep = 1;
 			int lineNo = 0;
 			int targetTotal = 0;
@@ -189,7 +184,7 @@ internal static class IgnoreList
 					continue;
 				}
 
-				// 注释行：先看是不是分区标记，否则跳过
+				// Comment line: a marker switches the section mode, anything else is skipped
 				if (IsComment(trimmed))
 				{
 					string body = trimmed.StartsWith("//", StringComparison.Ordinal)
@@ -214,8 +209,8 @@ internal static class IgnoreList
 
 				foreach (EntryToken token in SplitEntry(entry, log, lineNo))
 				{
-					// 行内写了 *数字 → 目标数量（双向），覆盖分区默认值；
-					// 没写 → 沿用分区的模式（全部无视 / 保留至少一个），保持老行为不变
+					// An inline *N makes it a target count (both directions) and overrides the section default;
+					// without a number the entry inherits the section mode
 					bool hasCount = token.KeepCount > 0;
 					int keepForEntry = hasCount ? Math.Min(token.KeepCount, MaxKeepCount) : modeKeep;
 					IgnoreMode modeForEntry = hasCount ? IgnoreMode.SetCount : mode;
@@ -229,7 +224,7 @@ internal static class IgnoreList
 					next[token.Name] = rule;
 					primaries.Add(token.Name);
 
-					// 允许省略 GEAR_ 前缀：同时塞一个去前缀的别名
+					// The GEAR_ prefix is optional: also store the stripped alias
 					if (token.Name.StartsWith("GEAR_", StringComparison.OrdinalIgnoreCase) && token.Name.Length > 5)
 					{
 						next[token.Name.Substring(5)] = rule;
@@ -247,7 +242,7 @@ internal static class IgnoreList
 				rules[kv.Key] = kv.Value;
 			}
 
-			// 统计只看用户真正写下的条目，不数 GEAR_ 前缀别名；目标数量单独计数（别名不进 targets）
+			// Count only the entries the player actually wrote, never the aliases; target counts live in their own table
 			foreach (string primary in primaries)
 			{
 				if (!next.TryGetValue(primary, out IgnoreRule rule))
@@ -285,7 +280,7 @@ internal static class IgnoreList
 		}
 	}
 
-	/// <summary>kind 需先按 <see cref="NormalizeName"/> 归一化（去 (Clone)）。不在清单里返回 Mode = None。</summary>
+	/// <summary><c>kind</c> must already be normalised (no (Clone)). Returns Mode = None when the kind is not listed.</summary>
 	internal static IgnoreRule Lookup(string kind)
 	{
 		if (rules.Count == 0 || string.IsNullOrEmpty(kind))
@@ -296,11 +291,11 @@ internal static class IgnoreList
 		return rules.TryGetValue(kind, out IgnoreRule rule) ? rule : IgnoreRule.None;
 	}
 
-	// ---------------------------------------------------------------- 解析
+	// ---------------------------------------------------------------- Parsing
 
 	/// <summary>
-	/// 识别分区标记。只接受「整行注释里只写标记本身」的形式，
-	/// 所以模板里那些带说明文字的示例行（含 —— 或括号说明）不会被误当成标记。
+	/// Recognises a section marker, but only when the whole comment is the marker itself, so the annotated example lines
+	/// in the template never switch modes.
 	/// </summary>
 	private static bool TryParseMarker(string body, out IgnoreMode mode, out int keepCount)
 	{
@@ -320,12 +315,12 @@ internal static class IgnoreList
 		{
 			if (!TryMatchKeyword(Squash(part), out IgnoreMode partMode, out int partCount))
 			{
-				return false; // 任何一段不像标记 → 整行按普通注释处理
+				return false; // One unexplained segment: treat the whole line as a plain comment
 			}
 
 			if (found != IgnoreMode.None && found != partMode)
 			{
-				return false; // 中英两段互相矛盾
+				return false; // The two halves disagree
 			}
 
 			found = partMode;
@@ -345,7 +340,7 @@ internal static class IgnoreList
 		return true;
 	}
 
-	/// <summary>squashed 已去掉所有空白并转小写。</summary>
+	/// <summary><paramref name="squashed"/> has no whitespace left and is lower case.</summary>
 	private static bool TryMatchKeyword(string squashed, out IgnoreMode mode, out int keepCount)
 	{
 		mode = IgnoreMode.None;
@@ -404,8 +399,8 @@ internal static class IgnoreList
 	}
 
 	/// <summary>
-	/// 「保留（至少一个）」这类带括号、不带具体数字的写法 —— 表示「默认留 1 个」。
-	/// 全角/半角括号、中英写法都认；判定前先去掉括号。
+	/// Matches the "at least one" phrasing, i.e. a keep marker with no explicit number, in either language and either
+	/// bracket width; brackets are stripped before matching.
 	/// </summary>
 	private static bool IsAtLeastOnePhrase(string tail)
 	{
@@ -466,7 +461,7 @@ internal static class IgnoreList
 		return int.TryParse(text, out int value) ? value : -1;
 	}
 
-	/// <summary>去空白 + 小写，标记判定用。</summary>
+	/// <summary>Strips whitespace and lower-cases the text; markers are matched against this form.</summary>
 	private static string Squash(string text)
 	{
 		var sb = new StringBuilder(text.Length);
@@ -484,7 +479,7 @@ internal static class IgnoreList
 		return sb.ToString();
 	}
 
-	/// <summary>一行拆出来的单个条目：物品名 + 行内指定的目标数量（0 = 没写，按分区默认）。</summary>
+	/// <summary>One entry from a line: item name plus the inline target count (0 = none, use the section default).</summary>
 	private readonly struct EntryToken
 	{
 		internal EntryToken(string name, int keepCount)
@@ -499,13 +494,12 @@ internal static class IgnoreList
 	}
 
 	/// <summary>
-	/// 拆一行里的多个条目（逗号/分号/制表符）。每个条目允许带「*数字」后缀表示目标数量：
-	/// <c>GEAR_HeavyBandage*4</c> → 名字 GEAR_HeavyBandage、背包保持 4 份。
-	/// 分隔符用 * 不用 #：# 是注释符号，放一起会有歧义。
+	/// Splits a line into entries on comma, semicolon or tab. A trailing <c>*N</c> sets the target count:
+	/// <c>GEAR_HeavyBandage*4</c> keeps 4 units in the backpack. <c>*</c> is used because <c>#</c> starts a comment.
 	/// </summary>
 	private static List<EntryToken> SplitEntry(string line, MelonLogger.Instance log, int lineNo)
 	{
-		// 容忍从别处粘贴过来的引号
+		// Tolerate quotes pasted in from elsewhere
 		if (line.Length >= 2 && ((line[0] == '"' && line[^1] == '"') || (line[0] == '\'' && line[^1] == '\'')))
 		{
 			line = line.Substring(1, line.Length - 2).Trim();
@@ -536,13 +530,13 @@ internal static class IgnoreList
 				{
 					if (digitsEnd < text.Length)
 					{
-						// *数字 后面还有字（比如 "GEAR_X*4 备用"），多余的当备注忽略
+						// Text after the digits ("GEAR_X*4 spare") is treated as a note
 						log.Msg($"  忽略清单第 {lineNo} 行 {head} 后面还有内容，已忽略：{text.Substring(digitsEnd).Trim()}");
 					}
 				}
 				else
 				{
-					// * 后面不是数字（或写了 0）—— 整段当备注丢掉，避免把 "GEAR_X* 备注" 当成物品名
+					// No valid digits after * (or a zero): drop it, otherwise "GEAR_X* note" would join the item name
 					log.Warning($"忽略清单第 {lineNo} 行 {head} 的 {Separator} 后面不是有效份数（需要至少 1 个纯数字），已忽略：{text.Substring(star + 1).Trim()}");
 				}
 
@@ -578,8 +572,8 @@ internal static class IgnoreList
 	}
 
 	/// <summary>
-	/// 去掉行尾注释（<c>//</c> 或 <c>#</c>）。份数后缀用的是 <c>*</c>，不受影响，
-	/// 所以 <c>GEAR_X*4</c> 不会被当成注释。若见到 <c>#数字</c> 这种旧写法，提示改用 <c>*</c>。
+	/// Strips a trailing comment (<c>//</c> or <c>#</c>). The count suffix uses <c>*</c>, so <c>GEAR_X*4</c> survives;
+	/// a <c>#N</c> form is reported once instead of silently collapsing into "keep one, move out only".
 	/// </summary>
 	private static string ExtractEntryText(string raw, MelonLogger.Instance log, int lineNo)
 	{
@@ -602,8 +596,8 @@ internal static class IgnoreList
 		{
 			cut = hash;
 
-			// 旧写法 ID#4 里的 # 现在会被当成注释，这里给一句提示，免得悄悄退化成「留 1 个、只出不进」。
-			// 只在 # 紧跟数字（老写法）时提示，`GEAR_X # 4 个备用` 这种正常注释不吵。
+			// A # followed by digits is the retired count syntax and now starts a comment, so say so; an ordinary
+			// trailing note such as "GEAR_X # 4 spare" stays quiet.
 			int k = hash + 1;
 			if (k < line.Length && char.IsDigit(line[k]))
 			{
@@ -615,7 +609,7 @@ internal static class IgnoreList
 		return cut < 0 ? line.Trim() : line.Substring(0, cut).Trim();
 	}
 
-	/// <summary>份数分隔符的位置；全角 ＊（中文输入法下容易打出来）一并当分隔符。</summary>
+	/// <summary>Index of the count separator, accepting the full-width variant that IMEs produce.</summary>
 	private static int IndexOfSeparator(string text)
 	{
 		for (int i = 0; i < text.Length; i++)
@@ -630,7 +624,8 @@ internal static class IgnoreList
 	}
 
 	/// <summary>
-	/// 从 <paramref name="starIndex"/> 处的 <c>*</c> 读份数。合法时返回份数并给出数字后的下标，否则返回 0。
+	/// Reads the count that starts at <paramref name="starIndex"/>, reporting the index just past the digits.
+	/// Returns 0 when what follows is not a plain number.
 	/// </summary>
 	private static int ParseCountSuffix(string text, int starIndex, out int digitsEnd)
 	{
@@ -666,7 +661,7 @@ internal static class IgnoreList
 		return int.TryParse(text.Substring(start, i - start), out int value) ? value : 0;
 	}
 
-	/// <summary>Unity 实例名会带 (Clone) 后缀，统一去掉再比较。</summary>
+	/// <summary>Unity instance names carry a (Clone) suffix; strip it before comparing kinds.</summary>
 	private static string NormalizeName(string name)
 	{
 		string n = name.Trim();
@@ -678,7 +673,7 @@ internal static class IgnoreList
 		return n;
 	}
 
-	// ---------------------------------------------------------------- 目录
+	// ---------------------------------------------------------------- Directory
 
 	private static string DirectoryPath()
 	{
@@ -698,12 +693,12 @@ internal static class IgnoreList
 		}
 		catch
 		{
-			// 老版本 MelonLoader 没有这个字段，走下面的兜底
+			// Older loaders do not expose this field; fall through to the assembly location
 		}
 
 		try
 		{
-			// 本 dll 就装在 Mods 目录里，取它自己所在的文件夹
+			// The dll lives in Mods, so its own folder is the answer
 			dirPath = Path.GetDirectoryName(typeof(IgnoreList).Assembly.Location);
 		}
 		catch

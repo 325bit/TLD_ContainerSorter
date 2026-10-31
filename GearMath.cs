@@ -4,10 +4,11 @@ using Il2CppTLD.IntBackedUnit;
 namespace ContainerSorter;
 
 /// <summary>
-/// 两个方向共用的物品读数：名字归一化、份数、单份/整堆重量、耐久、重量账本校验、销毁与份数还原。
-/// 抽出来是为了让 <see cref="ContainerTransfer"/>（背包 → 容器）与 <see cref="TargetCount"/>（容器 → 背包）
-/// 走同一套口径 —— 容差或归一化只要有一边走偏，「补到 N 份」和「留下 N 份」就会互相打架。
-/// 每个方法都会碰到读不到成员的物品（被别的 mod 改残、实例化到一半），所以一律 try 兜住。
+/// Item readings shared by both directions: name normalisation, unit counts, per-unit and total weight, condition,
+/// weight-ledger checks, destroy and unit restore.
+/// <see cref="ContainerTransfer"/> and <see cref="TargetCount"/> must use the same tolerances and the same
+/// normalisation here, otherwise "top up to N" and "keep N" keep undoing each other. Every member tolerates
+/// half-initialised items, so each one wraps its reads in try.
 /// </summary>
 internal static class GearMath
 {
@@ -28,7 +29,7 @@ internal static class GearMath
 		}
 	}
 
-	/// <summary>Unity 实例名会带 (Clone) 后缀，统一去掉再比较。</summary>
+	/// <summary>Unity instance names carry a (Clone) suffix; strip it before comparing kinds.</summary>
 	internal static string NormalizeName(string name)
 	{
 		string n = name.Trim();
@@ -52,7 +53,7 @@ internal static class GearMath
 		}
 	}
 
-	/// <summary>这一件算几份：堆叠就是 m_Units，非堆叠算 1。</summary>
+	/// <summary>Units in this instance: <c>m_Units</c> for a stack, 1 otherwise.</summary>
 	internal static int UnitsOf(GearItem gi)
 	{
 		try
@@ -65,7 +66,7 @@ internal static class GearMath
 		}
 		catch
 		{
-			// 读不到就当单件
+			// Unreadable stack data: treat it as a single unit
 		}
 
 		return 1;
@@ -83,7 +84,7 @@ internal static class GearMath
 		}
 	}
 
-	/// <summary>单份重量：一堆 20 支箭按每支摊开，非堆叠就是整件重量。比较「谁更重」用这个。</summary>
+	/// <summary>Weight of one unit (20 arrows share their weight); the whole item when it does not stack. Use this whenever comparing "which is heavier".</summary>
 	internal static float UnitKilograms(GearItem gi)
 	{
 		float kg = ItemKilograms(gi);
@@ -97,7 +98,7 @@ internal static class GearMath
 		}
 		catch
 		{
-			// 读不到堆叠信息就按整件算
+			// No stack data: fall back to the whole item
 		}
 
 		return kg;
@@ -115,7 +116,7 @@ internal static class GearMath
 		}
 	}
 
-	/// <summary>物品总重量（kg）；读不到返回 -1，让校验自动跳过。</summary>
+	/// <summary>Total item weight in kg; -1 when unreadable so callers skip the check.</summary>
 	internal static float SafeWeight(GearItem gi)
 	{
 		try
@@ -128,7 +129,7 @@ internal static class GearMath
 		}
 	}
 
-	/// <summary>数量改了以后核对重量变化是否符合预期（预期为负表示应该变轻）。抓不到基准重量就跳过校验。</summary>
+	/// <summary>Verifies that a unit change moved the weight by roughly the expected amount (negative = should get lighter). Skipped without a baseline weight.</summary>
 	internal static bool WeightMatches(float before, float after, float expected)
 	{
 		if (expected == 0f || before < 0f || after < 0f)
@@ -154,7 +155,7 @@ internal static class GearMath
 		}
 		catch
 		{
-			// 忽略
+			// Best effort: the instance is already gone
 		}
 	}
 
@@ -169,11 +170,11 @@ internal static class GearMath
 		}
 		catch
 		{
-			// 忽略
+			// Best effort: the instance is already gone
 		}
 	}
 
-	/// <summary>ItemWeight（内部以 long 记账）→ 公斤浮点。</summary>
+	/// <summary>ItemWeight (integer-backed) to kilograms.</summary>
 	internal static float ToKilograms(ItemWeight weight)
 	{
 		return weight / ItemWeight.FromKilograms(1f);

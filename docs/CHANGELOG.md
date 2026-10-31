@@ -1,71 +1,104 @@
-# 更新日志
+# Changelog
 
-## 1.10.0
+## 1.11.0 — the curing box works too
 
-- 新增「目标数量」：清单里写成 `物品ID*数字` 的物品，按键后背包里保持 N 份 ——
-  多出来的按既有逻辑搬进容器，不够的自动从容器取回差额（容器里有多少取多少，不够就补到能补的数量）
-- 只认 `物品ID*数字` 这一种写法：不带数字的条目、分区标记里的数字仍是「只出不进」的老行为
-- 取回时优先并进背包已有的同款堆叠（状态差太大就不并），没有可合并的才拆一份新的；
-  每个动作都核对「容器轻了 / 背包重了」是否约等于这几份，不符即回滚
-- 取回不受容器剩余容量限制，排在搬入之前执行，顺手腾出空间给后面的搬入
-- 汇总日志新增「从容器取回 N 份（K 种）」；物品读数（份数 / 重量 / 耐久 / 容差）抽成共用模块，
-  两个方向同一套口径
-- 新增离线桩工程跑解析与取回逻辑，改动这两块后先跑一遍再上机
+Why: pressing the sort key with a curing box open did nothing at all. The box is not a `Container` and opens its own panel, so the container gate was false and returned without a word.
 
-## 1.9.0
+- Added a curing-box pass. It routes on `Panel_CuringStorage` before the container gate and moves backpack items of the kinds already inside the box into it, up to the box's meat capacity.
+- Salt is not touched: the box keeps its own salt storage and its own salt weight, and the meat capacity is read on its own.
+- The capacity check lives in this mod because `CuringStorage.AddItem` validates nothing — not the kind, not the weight. The vanilla panel is the only thing that used to enforce it.
+- Items go in whole; a stack is skipped with a log line, since the box records one curing entry per object.
+- The ignore list applies as before: Ignore All skips, keep counts stay in the backpack, and a `ID*N` target only trims the surplus — nothing is ever taken out of a box.
+- New setting `UseCuringBox` (on by default) turns the whole path off without falling back to the container logic.
+- Offline stub project extended with the curing-box scenario set.
 
-- 份数分隔符由 `#` 改为 `*`：`#` 恢复为纯注释符号，不再和份数判定冲突
-  （`GEAR_X # 4 个备用` 这种尾注不会再被误解成「留 4 个」）
-- 全角 `＊` 同样识别；`*` 后面不是数字时整段当备注丢弃并给出提示
-- 旧写法 `GEAR_X#4` 不再生效，日志会提醒改用 `*`
-- 清单模板与说明改为中英双语
+## 1.10.0 — target counts work in both directions
 
-## 1.8.0
+Why: a keep count could only stop items from going into the container. What players actually wanted was a fixed number of arrows, ammo or bandages in the backpack, without doing the subtraction themselves.
 
-- 分区标签改为 `#保留（至少一个）/Keep At Least One`（旧写法 `#保留一个/Keep One`、`#keep N` 仍兼容）
-- 条目支持 `物品ID#数字` 指定保留份数，不写默认留 1 个
-- 「保留」从「每种留一个实例」升级为「每种留够 N 份」，非堆叠物品也可指定件数
+- Added target counts: `ID*N` in the ignore list keeps the backpack at N units. A surplus moves into the container under the existing rule, a shortfall is taken back out of it (as much as the container holds).
+- Only `ID*N` behaves this way. Bare entries and numbers inside a section marker stay one-way, as before.
+- Partial takes merge into a matching backpack stack first (condition gap permitting) and split a new stack only when there is nothing to merge with. Every action checks that the container lost and the backpack gained roughly the weight of those units, and rolls back when it does not.
+- Taking items out is not limited by the container's remaining capacity and runs before the move-in pass, which frees space for it.
+- The completion summary gained "units taken back"; item readings (units, weight, condition, tolerance) were extracted into a shared module so both directions use one set of rules.
+- Added an offline stub project covering parsing and the take-out logic; run it before touching either area.
 
-## 1.7.0
+Documentation, no behaviour change:
 
-- 修复：整组物品超重时整堆放弃（容器剩 40kg、背包 100 张狼皮却一张都不搬）
-- 现在按 `剩余容量 ÷ 单份重量` 拆堆搬运，一直搬到塞不下单个物品为止
-- 汇总行新增「N 堆因剩余容量只搬了一部分」
+- README rewritten as a bilingual package (English block first, Chinese block second) with the settings table, ignore-list section and FAQ kept in sync between the two.
+- `docs/DEVELOPMENT.md` restructured into the 14-section maintainer layout, now in English, including the design-constraint table and the comment migration map.
+- All source comments translated to English and trimmed to conclusions; the narratives they carried moved into the development document.
 
-## 1.6.0
+## 1.9.0 — the count separator became `*`
 
-- 「保留」时耐久打平（差值 ≤ 0.1%）则比较单份重量，留轻的、重的进容器（主要针对肉类）
-- 迁移顺序同种内改为按单份重量从重到轻，容器快满时先塞重的
-- 新增设置项「耐久相同时优先搬更重的」
+Why: `#` was both the comment marker and the count separator, so `GEAR_X # 4 spare` could be read as either. One character cannot mean two things.
 
-## 1.5.0
+- The count separator is `*`; `#` is a comment marker again and stays out of count parsing.
+- The full-width variant is recognised too, and a `*` that is not followed by a number drops the suffix with a warning.
+- The retired `GEAR_X#4` form no longer works; the log points at `*` once per offending line.
+- The generated list template is bilingual.
 
-- 迁移后即时刷新界面：重建表格 + 下一帧重算过滤列表 + 同步背包面板
-- 修复搬完后界面偶尔残留已搬走条目
+## 1.8.0 — keep N units, not just one instance
 
-## 1.4.0
+Why: "keep one" was expressed as one instance, which is wrong for stacks — one stack of 20 arrows is not one arrow.
 
-- 「保留」时同种物品耐久不同，背包留耐久最低的那件，状态好的进容器
-- 新增设置项「保留时优先把高耐久放进容器」
+- The section label became Keep At Least One; the older labels are still accepted.
+- Entries accept `ID#N` to set the count, defaulting to 1.
+- Keeping is now counted in units, so a kind that does not stack can also be limited to N pieces.
 
-## 1.3.0
+## 1.7.0 — split a stack instead of giving up on it
 
-- 忽略清单支持分区：`#全部无视/Ignore All` 与 `#保留一个/Keep One`
-- 「保留」对非堆叠物品同样有效（同种多件时留状态最好的那把）
-- 清单标签改为中英双语
+Why: a 100-pelt stack weighing 50 kg was skipped entirely in a container with 40 kg of room, although dozens of pelts would have fit.
 
-## 1.2.0
+- Oversized stacks are split by `remaining capacity / unit weight` and moved part by part, until not even one unit fits.
+- The summary line reports how many stacks were moved only partially.
 
-- 新增忽略清单 `Mods/ContainerSorterIgnore.txt`，首次运行自动生成模板
-- 支持注释、逗号分多值、省略 `GEAR_` 前缀；按修改时间热重载，改完不用重启
+## 1.6.0 — heavier pieces first when condition ties
 
-## 1.1.0
+Why: with equal freshness, the 1 kg meat should be stored and the 0.5 kg piece kept, but the order was arbitrary.
 
-- 按键改为真正的按键绑定（ModSettings 重绑定控件），可自由改键
-- 可堆叠物品并入容器里已有的堆叠，而不是落成新的一堆
-- 新增设置项「合并可堆叠物品」
+- When conditions differ by 0.1% or less, the lighter per-unit item stays in the backpack and the heavier one is stored.
+- Within a kind, heavier per-unit items now move first, so a nearly full container takes them.
+- Added the "heavier first when condition ties" setting.
 
-## 1.0.0
+## 1.5.0 — refresh the panels after moving
 
-- 首个版本：容器面板内按键，把背包中与容器重复的种类按剩余容量搬进容器
-- 支持穿戴 / 手持 / 小背包 / 隐藏供给的跳过开关与详细日志
+Why: items disappeared from the data but stayed visible in the list until the panel was reopened.
+
+- Refresh after every run: rebuild the tables, request a forced rebuild for the next frame, and refresh the inventory panel as well.
+- Fixed rows of already moved items lingering in the list.
+
+## 1.4.0 — keep the worst, store the best
+
+Why: keeping an arbitrary instance of a kind meant the good copy could end up in the container and the worn one in the backpack.
+
+- With different conditions, the lowest condition stays in the backpack and the good piece is stored.
+- Added the "keep the best in the container" setting.
+
+## 1.3.0 — sections in the ignore list
+
+Why: one flat list could not express "never move this" and "keep one of these" at the same time.
+
+- The list supports sections: Ignore All and Keep One.
+- Keeping also works for items that do not stack: with several of a kind, one stays and the rest move in.
+- Section labels are bilingual.
+
+## 1.2.0 — an ignore list on disk
+
+Why: some kinds should never be sorted automatically, and hard-coding them means a rebuild for every preference change.
+
+- Added `Mods/ContainerSorterIgnore.txt`, generated with a template on first run.
+- Comments, several entries per line and an optional `GEAR_` prefix are supported; the file reloads when its timestamp changes, so no restart is needed.
+
+## 1.1.0 — a real key binding, and stack merging
+
+Why: a fixed key collides with other mods, and moving 20 firewood next to an existing log produced two stacks instead of 21.
+
+- The key is a genuine binding (ModSettings rebind control) and can be changed freely.
+- Stackable items merge into an existing container stack instead of landing as a new one.
+- Added the "merge stackable items" setting.
+
+## 1.0.0 — first release
+
+- Sort on a key while a container panel is open: kinds the container already holds move in, limited by the remaining capacity.
+- Skip toggles for worn, held, satchel and hidden-supply items, plus a verbose log.

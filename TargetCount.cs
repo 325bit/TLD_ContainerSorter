@@ -5,19 +5,19 @@ using MelonLoader;
 namespace ContainerSorter;
 
 /// <summary>
-/// 「目标数量」规则（清单里的 <c>物品ID*数字</c>）的出场方向：背包里该物品少于 N 份时，从当前打开的容器取回差额。
-/// 反方向（背包多于 N 份时搬进容器）由 <see cref="ContainerTransfer"/> 的既有搬入流程按同一份规则完成，
-/// 所以两边都只认 <see cref="IgnoreList.Lookup"/> 的结果，规则解析只有一处。
-/// 只在容器里已经有这种物品时动作 —— 不会凭标签把容器里没有的种类变出来。
+/// Take-out half of the target-count rule (<c>ID*count</c>): when the backpack holds fewer than N units, take the
+/// difference back out of the open container. The other direction lives in <see cref="ContainerTransfer"/>, which reads
+/// the same <see cref="IgnoreList.Lookup"/> rule, so the list is parsed in exactly one place.
+/// Only kinds the container actually holds are topped up — a label never conjures items out of nothing.
 /// </summary>
 internal static class TargetCount
 {
 	/// <summary>
-	/// 逐条核对目标数量，把背包不够的份数从 <paramref name="container"/> 取回。
-	/// 必须在搬入流程之前调用：这一步是从容器往外拿，顺手腾出空间给后面的搬入用。
+	/// Walks the target counts and takes the missing units back out of <paramref name="container"/>.
+	/// Must run before the move-in pass: it takes items out, which frees the space they need.
 	/// </summary>
-	/// <param name="movedUnits">实际取回的份数合计。</param>
-	/// <param name="filledKinds">发生取回的种类数。</param>
+	/// <param name="movedUnits">Total units actually taken back.</param>
+	/// <param name="filledKinds">Kinds that received at least one unit.</param>
 	internal static void Fill(Container container, Inventory inv, MelonLogger.Instance log, Settings cfg, out int movedUnits, out int filledKinds)
 	{
 		movedUnits = 0;
@@ -43,7 +43,7 @@ internal static class TargetCount
 			int current = CountInInventory(inv, kind);
 			if (current >= target)
 			{
-				continue; // 刚好够 / 超出：多出来的那部分交给搬入流程
+				continue; // At or above target: the surplus is the move-in pass's job
 			}
 
 			List<GearItem> sources = CollectContainerStacks(container, kind);
@@ -81,7 +81,7 @@ internal static class TargetCount
 
 				if (!ok)
 				{
-					continue; // 这一堆动不了就换下一堆，别让一次失败毁掉整类
+					continue; // Try the next stack; one failure must not abandon the whole kind
 				}
 
 				got += take;
@@ -114,9 +114,9 @@ internal static class TargetCount
 	}
 
 	/// <summary>
-	/// 背包里该种物品的总份数。口径刻意包含穿戴中 / 手持 / 小包内的实例：
-	/// 设置项只决定「能不能搬」，不该影响「背包里到底有几个」，否则拿在手上的工具会被算成 0 份、
-	/// 白白多取一件回来。
+	/// Total units of a kind in the backpack, deliberately including worn, held and satchel items: the skip settings
+	/// decide what may be moved, not how many the player owns. Counting only movable instances would read a held tool
+	/// as zero and pull a spare one out of the container.
 	/// </summary>
 	private static int CountInInventory(Inventory inv, string kind)
 	{
@@ -152,7 +152,7 @@ internal static class TargetCount
 			}
 			catch
 			{
-				// 单件读不到就跳过，不影响其它条目
+				// Unreadable instance: skip it, keep counting the rest
 			}
 		}
 
@@ -160,8 +160,8 @@ internal static class TargetCount
 	}
 
 	/// <summary>
-	/// 容器里该种物品的每一堆。状态好的排在前面（先给玩家最好的那份），
-	/// 状态打平时先搬小堆，少拆几次对象。
+	/// Every stack of that kind in the container, best condition first so the player gets the good copy,
+	/// then the smallest stack, which means fewer objects have to be split.
 	/// </summary>
 	private static List<GearItem> CollectContainerStacks(Container container, string kind)
 	{
@@ -193,7 +193,7 @@ internal static class TargetCount
 			}
 			catch
 			{
-				// 单件读不到就跳过
+				// Unreadable instance: skip it
 			}
 		}
 
@@ -205,7 +205,7 @@ internal static class TargetCount
 		return result;
 	}
 
-	/// <summary>结果为负表示 a 该先被取走：耐久高的优先，其次份数少的优先。</summary>
+	/// <summary>Negative means <paramref name="a"/> is taken first: higher condition wins, then the smaller stack.</summary>
 	private static int CompareSourcePriority(GearItem a, GearItem b)
 	{
 		float condA = GearMath.Condition(a);
@@ -219,11 +219,12 @@ internal static class TargetCount
 		return GearMath.UnitsOf(a).CompareTo(GearMath.UnitsOf(b));
 	}
 
-	// ---------------------------------------------------------------- 取回动作
+	// ---------------------------------------------------------------- Take actions
 
 	/// <summary>
-	/// 整堆都取回：走原版「从容器取出」的接口，背包侧该有的标记与通知都由游戏自己处理。
-	/// 取完核对物品确实到了背包（实例在列表里，或背包总重涨了约一堆），没到就退回背包接口、再不行放回容器。
+	/// Takes the whole stack out through the vanilla container API, which handles the backpack-side flags and notices.
+	/// Afterwards the item must actually be in the backpack (instance found, or total weight rose by roughly the stack);
+	/// if not, add it explicitly, and if even that fails put it back into the container.
 	/// </summary>
 	private static bool MoveWhole(GearItem gi, Container container, Inventory inv, MelonLogger.Instance log, bool verbose)
 	{
@@ -280,8 +281,8 @@ internal static class TargetCount
 	}
 
 	/// <summary>
-	/// 只取一部分：背包里有同款且状态接近的堆就挪份数，没有就拆一份新的出来。
-	/// 两条路都得让背包份数真的涨上去，涨不上就原样退回。
+	/// Takes only part of a stack: shift units into a compatible backpack stack, or split a new one off.
+	/// Either path has to raise the backpack unit count for real; if it does not, nothing is moved.
 	/// </summary>
 	private static bool TakePart(GearItem source, Inventory inv, string kind, int take, MelonLogger.Instance log, bool verbose)
 	{
@@ -295,9 +296,9 @@ internal static class TargetCount
 	}
 
 	/// <summary>
-	/// 在容器堆和背包堆之间挪 <paramref name="take"/> 份：只改两边的 m_Units，不碰任何增删接口。
-	/// 改完核对「容器轻了、背包重了」都约等于这几份的重量，不符就双向回滚（同一份物品的重量账本
-	/// 在别的 mod 里被改过时，这一步能挡住算错的负重）。
+	/// Shifts <paramref name="take"/> units between a container stack and a backpack stack by editing <c>m_Units</c>
+	/// only, never the add/remove API. Both weight deltas must match the weight of those units, otherwise both sides are
+	/// rolled back — that check catches a weight ledger another mod has rewritten, which would otherwise skew encumbrance.
 	/// </summary>
 	private static bool ShiftUnits(GearItem source, GearItem target, int take, MelonLogger.Instance log, bool verbose)
 	{
@@ -316,7 +317,7 @@ internal static class TargetCount
 			return false;
 		}
 
-		// 取整堆走 MoveWhole；这里只处理「容器里还留一部分」，份数账对不上一律不动
+		// Whole stacks go through MoveWhole; here a part must stay behind, and any unit mismatch is refused
 		if (take <= 0 || take >= sourceUnits || targetUnits <= 0)
 		{
 			return false;
@@ -368,9 +369,9 @@ internal static class TargetCount
 	}
 
 	/// <summary>
-	/// 背包里没有可合并的堆时：从容器那一堆拆一份 <paramref name="take"/> 份的新对象放进背包，
-	/// 再把源堆份数扣掉。顺序是「先扣容器、再进背包、最后核对」，任何一步不成都用 <see cref="GearMath.RestoreUnits"/>
-	/// 把容器份额还原，绝不让两边各留一份。
+	/// With no backpack stack to merge into: split a <paramref name="take"/>-unit copy off the container stack and add it
+	/// to the backpack, then deduct those units from the container. Order is deduct, add, verify; any failure restores the
+	/// container units with <see cref="GearMath.RestoreUnits"/>, so the same units never exist on both sides.
 	/// </summary>
 	private static bool InstantiatePart(GearItem source, Inventory inv, int take, MelonLogger.Instance log, bool verbose)
 	{
@@ -427,7 +428,7 @@ internal static class TargetCount
 				return false;
 			}
 
-			// 复制出来的对象会带着源件的容器/背包标记，交给 AddGear 自己维护
+			// The clone inherits the source's container and backpack flags; AddGear maintains them
 			part.m_InPlayerInventory = false;
 			part.m_IsInSatchel = false;
 
@@ -435,7 +436,7 @@ internal static class TargetCount
 			float partKg = GearMath.ItemKilograms(part);
 			float invBefore = InventoryKilograms(inv);
 
-			// 容器先扣：扣不动就直接放弃，背包那边还没被动过
+			// Deduct from the container first: if that fails nothing has touched the backpack yet
 			source.m_StackableItem.m_Units = sourceUnits - take;
 			if (source.m_StackableItem.m_Units != sourceUnits - take)
 			{
@@ -471,8 +472,8 @@ internal static class TargetCount
 	}
 
 	/// <summary>
-	/// 背包里能和新取出的份数并成同一堆的那一堆：同 prefab、都是真堆叠、非液体、状态差值在原版允许范围内。
-	/// 找不到返回 null，调用方改走「拆一份新的」。
+	/// The backpack stack that the taken units can join: same prefab, both real stacks, no liquid, and a condition gap the
+	/// vanilla limit allows. Returns null when there is none, and the caller splits a new stack instead.
 	/// </summary>
 	private static GearItem? FindInventoryStack(Inventory inv, GearItem source, string kind)
 	{
@@ -481,13 +482,13 @@ internal static class TargetCount
 			StackableItem? srcStack = source.m_StackableItem;
 			if (srcStack == null || source.m_LiquidItem != null)
 			{
-				return null; // 不是堆叠物品；液体按体积记账，不掺和
+				return null; // Not a stack; liquids are accounted by volume and stay out of this
 			}
 
 			float maxDiff = srcStack.m_StackConditionDifferenceConstraint;
 			if (maxDiff <= 0f)
 			{
-				maxDiff = 5f; // 原版没填时给 5% 的宽容度
+				maxDiff = 5f; // Vanilla leaves 0 in places; 5% keeps fresh food away from nearly rotten food
 			}
 
 			float condition = source.GetNormalizedCondition();
@@ -548,11 +549,11 @@ internal static class TargetCount
 		}
 	}
 
-	// ---------------------------------------------------------------- 工具
+	// ---------------------------------------------------------------- Helpers
 
 	/// <summary>
-	/// 物品是不是清单里写的那种（按去掉 (Clone) 后的 prefab 名比较）。
-	/// 清单允许省略 <c>GEAR_</c> 前缀，这里跟着放行 —— 否则写 <c>Arrow*20</c> 会一条都对不上。
+	/// Whether an item is the kind named in the list, compared by prefab name with the (Clone) suffix removed.
+	/// The list may omit the <c>GEAR_</c> prefix and this accepts that too, otherwise <c>Arrow*20</c> would match nothing.
 	/// </summary>
 	private static bool IsKind(string name, string kind)
 	{
@@ -567,7 +568,7 @@ internal static class TargetCount
 			&& string.Equals(normalized.Substring(5), kind, StringComparison.OrdinalIgnoreCase);
 	}
 
-	/// <summary>物品确实落到背包里了：实例能被查到，或背包总重涨了约一件物品那么多（合堆时实例会被销毁）。</summary>
+	/// <summary>Whether the item really landed in the backpack: instance found, or total weight rose by about one item (merging destroys the instance).</summary>
 	private static bool LandedInInventory(Inventory inv, int instanceId, float weightBefore, float itemKg)
 	{
 		try
@@ -579,14 +580,14 @@ internal static class TargetCount
 		}
 		catch
 		{
-			// 查不到就算没到，走重量判断
+			// Not found: fall through to the weight check
 		}
 
 		float after = InventoryKilograms(inv);
 		return weightBefore >= 0f && after >= weightBefore + itemKg * 0.5f;
 	}
 
-	/// <summary>背包总重（kg）；读不到返回 -1，让校验自动跳过。</summary>
+	/// <summary>Total backpack weight in kg; -1 when unreadable so the check is skipped.</summary>
 	private static float InventoryKilograms(Inventory inv)
 	{
 		try
